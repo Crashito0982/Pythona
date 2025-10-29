@@ -363,46 +363,20 @@ INSERT #AxntContratosRaw
         WHERE TRY_CONVERT(BIGINT, b.valor) IN (SELECT valor FROM #ClientesConContrato)
     )
     INSERT #CIsFinal
-    SELECT anho, anho_mes, anho_mes_dia, vcn_iddo, VE_ID, nombre_fisico, nombre_logico,
-           tipo_documento, renombrar_archivo, nro_guia, nro_cliente, fecha_creacion
-    FROM CIsLS
-    WHERE rn = 1;
-
-    /* 4.2) Fallback en Axentria para los que no aparecieron en LS */
-    ;WITH faltantes AS (
-        SELECT valor FROM #ClientesConContrato c
-        WHERE NOT EXISTS (SELECT 1 FROM #CIsFinal f WHERE f.nro_cliente = c.valor)
-    ), CIsAX AS (
-        SELECT *,
-               ROW_NUMBER() OVER (PARTITION BY TRY_CONVERT(BIGINT, a.vcn_valor)
-                                  ORDER BY e.ve_fechaCreacion DESC, e.VE_ID DESC) rn
-        FROM ODSP_AXNT_VALORCAMPONUM a
-        LEFT JOIN ODSP_axnt_tipodoc   c ON a.vcn_idtd = c.td_id
-        LEFT JOIN ODSP_axnt_contenido d ON a.vcn_iddo = d.co_id
-        LEFT JOIN ODSP_axnt_version   e ON a.vcn_iddo = e.ve_iddo
-        LEFT JOIN ODSP_axnt_AlmacenFS f ON e.ve_idalmacen = f.alfs_id
-        WHERE c.td_id = 104
-          AND a.vcn_idcm = 21
-          AND TRY_CONVERT(BIGINT, a.vcn_valor) IN (SELECT valor FROM faltantes)
-    )
-    INSERT #CIsFinal
     SELECT
-        CAST(CONVERT(nvarchar(4),  e.ve_fechaCreacion, 112) AS INT) AS anho,
-        CAST(CONVERT(nvarchar(6),  e.ve_fechaCreacion, 112) AS INT) AS anho_mes,
-        CAST(CONVERT(nvarchar(8),  e.ve_fechaCreacion,112)  AS INT) AS anho_mes_dia,
+        CAST(CONVERT(nvarchar(4),  a.ve_fechaCreacion, 112) AS INT) AS anho,
+        CAST(CONVERT(nvarchar(6),  a.ve_fechaCreacion, 112) AS INT) AS anho_mes,
+        CAST(CONVERT(nvarchar(8),  a.ve_fechaCreacion,112)  AS INT) AS anho_mes_dia,
         a.vcn_iddo,
-        e.VE_ID,
-        CONCAT(RIGHT(f.alfs_camino, 2), '\\',a.vcn_iddo, '_', e.VE_ID) AS nombre_fisico,
-        d.co_nombre as nombre_logico,
+        a.VE_ID,
+        CONCAT(RIGHT(a.alfs_camino, 2), '\', a.vcn_iddo, '_', a.VE_ID) AS nombre_fisico,
+        a.co_nombre as nombre_logico,
         'CEDULA DE IDENTIDAD' AS tipo_documento,
         'SI' as renombrar_archivo,
         NULL as nro_guia,
-        TRY_CONVERT(BIGINT, a.vcn_valor) as nro_cliente,
-        e.ve_fechaCreacion as fecha_creacion
+        a.nro_cliente as nro_cliente,
+        a.ve_fechaCreacion as fecha_creacion
     FROM CIsAX a
-    JOIN ODSP_axnt_version   e ON a.vcn_iddo = e.ve_iddo
-    JOIN ODSP_axnt_contenido d ON a.vcn_iddo = d.co_id
-    JOIN ODSP_axnt_AlmacenFS f ON e.ve_idalmacen = f.alfs_id
     WHERE a.rn = 1;
 
     /* =========================================================
