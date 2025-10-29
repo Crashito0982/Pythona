@@ -498,17 +498,52 @@ FROM #CIsFinal;
     END
 
     /* Final: solo clientes del set logístico (evita OR en join) */
-    IF OBJECT_ID('dbo.crm_legit_axnt_base_modelo_OPT') IS NOT NULL DROP TABLE dbo.crm_legit_axnt_base_modelo_OPT;
-    SELECT DISTINCT
-        uc.anho, uc.anho_mes, uc.anho_mes_dia, uc.fecha_creacion, uc.vcn_iddo,
-        uc.VE_ID, uc.nombre_fisico, uc.nombre_logico, uc.tipo_documento,
-        uc.renombrar_archivo, uc.nro_guia, uc.nro_cliente
-    INTO dbo.crm_legit_axnt_base_modelo_OPT
-    FROM #Combinado AS uc
-    WHERE EXISTS (SELECT 1 FROM #ClientesLogistica c WHERE c.valor = uc.nro_cliente);
+    IF OBJECT_ID('dbo.crm_legit_axnt_base_modelo_OPT','U') IS NULL
+BEGIN
+    CREATE TABLE dbo.crm_legit_axnt_base_modelo_OPT
+    (
+        anho INT,
+        anho_mes INT,
+        anho_mes_dia INT,
+        fecha_creacion DATETIME2(0),
+        vcn_iddo INT NULL,
+        VE_ID INT NULL,
+        nombre_fisico VARCHAR(260),
+        nombre_logico VARCHAR(255),
+        tipo_documento NVARCHAR(200),
+        renombrar_archivo CHAR(2),
+        nro_guia VARCHAR(50) NULL,
+        nro_cliente BIGINT
+    );
+END
+ELSE
+BEGIN
+    TRUNCATE TABLE dbo.crm_legit_axnt_base_modelo_OPT;
+END;
+
+INSERT dbo.crm_legit_axnt_base_modelo_OPT
+(
+    anho, anho_mes, anho_mes_dia, fecha_creacion, vcn_iddo, VE_ID,
+    nombre_fisico, nombre_logico, tipo_documento, renombrar_archivo,
+    nro_guia, nro_cliente
+)
+SELECT DISTINCT
+    uc.anho, uc.anho_mes, uc.anho_mes_dia, uc.fecha_creacion, uc.vcn_iddo,
+    uc.VE_ID, uc.nombre_fisico, uc.nombre_logico, uc.tipo_documento,
+    uc.renombrar_archivo, uc.nro_guia, uc.nro_cliente
+FROM #Combinado AS uc
+WHERE EXISTS (SELECT 1 FROM #ClientesLogistica c WHERE c.valor = uc.nro_cliente);
+
 
     /* Índice útil para la dtsx/consumo */
-    CREATE INDEX IX_crm_legit_axnt_base_modelo_OPT_cliente ON dbo.crm_legit_axnt_base_modelo_OPT(nro_cliente, tipo_documento);
+    IF NOT EXISTS (
+    SELECT 1 FROM sys.indexes 
+    WHERE object_id = OBJECT_ID('dbo.crm_legit_axnt_base_modelo_OPT')
+      AND name = 'IX_crm_legit_axnt_base_modelo_OPT_cliente')
+BEGIN
+    CREATE INDEX IX_crm_legit_axnt_base_modelo_OPT_cliente 
+    ON dbo.crm_legit_axnt_base_modelo_OPT(nro_cliente, tipo_documento);
+END;
 
     /* Limpieza explícita (opcional, #temp se descarta al finalizar el scope) */
     -- DROP TABLE IF EXISTS ...
