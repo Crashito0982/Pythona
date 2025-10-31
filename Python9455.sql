@@ -114,31 +114,6 @@ BEGIN
                       or (TDCPRI = ''105'' and TDCID = 89))'; 
         EXEC sp_executesql @sql_2;
     END
-    ELSE
-    BEGIN
-        -- Si no hay eventos en el rango, crear una tabla vacía con el MISMO ESQUEMA esperado
-        IF OBJECT_ID('[ag_eventos_entregados_temp_PRUEBA]') IS NOT NULL DROP TABLE [ag_eventos_entregados_temp_PRUEBA];
-        SELECT TOP (0)
-            b.TDCDS as descrip_doc,
-            cast(a.DOCID as varchar(20)) as docid,
-            a.DOCGU as nro_guia,
-            a.docnm as nombre_cliente,
-            TRY_CONVERT(BIGINT, a.DOCCTI) as nro_cliente,
-            a.DOCTDC AS tipo_documento_logistica,
-            a.DOCTDN AS nro_documento,
-            a.DOCES as estado_cabecera,
-            a.docedf as fecha_act,
-            a.doccb as id_doc_cod_barra,
-            a.docerm as tipo_tarjeta,
-            a.docori as cod_tipo_tarjeta,
-            a.docpri as tipo_producto,
-            b.TDCID as tipo_producto_det,
-            a.doccd as ciudad_cliente
-        INTO [ag_eventos_entregados_temp_PRUEBA]
-        FROM [ODSP_LGLIB_LGMDOC] a
-        LEFT JOIN [ODSP_LGLIB_LGMTDC] b ON 1=0
-        WHERE 1=0;
-    END;
 
     -- PASO 2: Lógica de Clientes Titulares (Tablas ADI)
     DROP TABLE IF EXISTS AT_CMDTS.DBO.LS_TMP_TC_ADI_PRUEBA;
