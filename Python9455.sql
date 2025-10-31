@@ -149,19 +149,19 @@ BEGIN
         [AT_CMDTS].[dbo].[ls_eventos_entregados_temp_new_PRUEBA]
     from
         [AT_CMDTS].[dbo].[ag_eventos_entregados_temp_PRUEBA] a
-        inner join AT_CMDTS.DBO.LS_TMP_TC_ADI_2_PRUEBA b
+        LEFT JOIN AT_CMDTS.DBO.LS_TMP_TC_ADI_2_PRUEBA b
             on b.ID_LOGISTICA=a.docid;
 
     -- PASO 3: Crear lista de clientes únicos
     DROP TABLE IF EXISTS [AT_CMDTS].[dbo].[ClientesParaActivar_PRUEBA];
-    SELECT DISTINCT nro_cliente AS valor
-    INTO [AT_CMDTS].[dbo].[ClientesParaActivar_PRUEBA]
-    FROM [ls_eventos_entregados_temp_new_PRUEBA]
-    WHERE nro_cliente IS NOT NULL
-    UNION 
-    SELECT DISTINCT NRO_CLIENTE_TITULAR
-    FROM [ls_eventos_entregados_temp_new_PRUEBA]
-    WHERE NRO_CLIENTE_TITULAR IS NOT NULL; 
+SELECT DISTINCT TRY_CONVERT(BIGINT, nro_cliente) AS valor
+INTO [AT_CMDTS].[dbo].[ClientesParaActivar_PRUEBA]
+FROM [ag_eventos_entregados_temp_PRUEBA]
+WHERE TRY_CONVERT(BIGINT, nro_cliente) IS NOT NULL
+UNION 
+SELECT DISTINCT NRO_CLIENTE_TITULAR
+FROM [ls_eventos_entregados_temp_new_PRUEBA]
+WHERE NRO_CLIENTE_TITULAR IS NOT NULL; 
 
     -- PASO 4: Procesar Contratos
     -- 4.1: Obtener datos raw de contratos
