@@ -20,20 +20,15 @@ from sqlConn import sqlConn
 # y mantener la misma estructura de carpetas:
 #   BRITIMP/CONSOLIDADO/AAAA-MM-DD/*.csv
 
-ROOT_DEFAULT = r"//nfs_airflow_py/cmdat/ea-saa-datos/Transportadoras/Britimp"
-ROOT = os.getenv("BRITIMP_ROOT", ROOT_DEFAULT)
-
-# Esta ruta siempre apunta a la carpeta CONSOLIDADO bajo ROOT
-CONSOLIDADO_BASE = os.path.join(ROOT, "CONSOLIDADO")
+ROOT = r"/home/leonardd/Plexus/BRITIMP/CONSOLIDADO/2025-11-04"
 
 
 def ruta_consolidado_fecha(fecha: str) -> str:
     """
-    Devuelve la carpeta de CONSOLIDADO para la fecha dada (YYYY-MM-DD),
-    por ejemplo:
-        {ROOT}/CONSOLIDADO/2025-11-04
+    Versión de prueba local: la carpeta de consolidados ya incluye la fecha,
+    por lo que simplemente devolvemos ROOT ignorando el parámetro fecha.
     """
-    return os.path.join(CONSOLIDADO_BASE, fecha)
+    return ROOT
 
 
 def checkea_archivos_creados(fecha: str) -> int:
