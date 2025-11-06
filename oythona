@@ -16,14 +16,19 @@ PREDEF_CONN = "AT_CMDTS"
 # HELPERS
 # ======================================================
 
-def limpiar_columna_numerica(serie, decimales=None):
+def limpiar_columna_numerica(serie):
+    """
+    Quita formato y convierte a número:
+      - "" y "-" -> NULL
+      - quita "." de miles
+      - "," decimal -> "."
+      - errors='coerce' -> no numérico -> NaN
+    """
     serie = serie.astype(str).str.strip()
     serie = serie.replace({"": None, "-": None})
     serie = serie.str.replace(".", "", regex=False)
     serie = serie.str.replace(",", ".", regex=False)
     serie = pd.to_numeric(serie, errors="coerce")
-    if decimales is not None:
-        serie = serie.round(decimales)
     return serie
 
 
@@ -41,11 +46,23 @@ def cargar_datos():
         print(f"[{tabla}] Hoja '{hoja}' vacía. No se insertan datos.")
         return
 
-    df["Milaje"] = limpiar_columna_numerica(df["Milaje"], 2)
-    df["Precio Km"] = limpiar_columna_numerica(df["Precio Km"], 0)
-    df["Kms"] = limpiar_columna_numerica(df["Kms"], 0)
-    df["Costo KM"] = limpiar_columna_numerica(df["Costo KM"], 0)
+    # Parsear numéricos
+    df["Milaje"] = limpiar_columna_numerica(df["Milaje"])
+    df["Precio Km"] = limpiar_columna_numerica(df["Precio Km"])
+    df["Kms"] = limpiar_columna_numerica(df["Kms"])
+    df["Costo KM"] = limpiar_columna_numerica(df["Costo KM"])
 
+    # Redondeos:
+    # MILAJE -> 2 decimales
+    df["Milaje"] = df["Milaje"].round(2)
+
+    # PRECIO_KM, KMS, COSTO_KM -> sin decimales (enteros)
+    for col in ["Precio Km", "Kms", "Costo KM"]:
+        df[col] = df[col].round(0)
+        # Entero nullable (para soportar NaN)
+        df[col] = df[col].astype("Int64")
+
+    # Renombrar columnas al esquema de la tabla
     rename_map = {
         "Agencias_Transportadora": "AGENCIAS_TRANSPORTADORA",
         "Agencias_Transportadoras": "AGENCIAS_TRANSPORTADORA",  # por si viene así
@@ -102,7 +119,8 @@ def cargar_parametros():
         print(f"[{tabla}] Hoja '{hoja}' vacía. No se insertan datos.")
         return
 
-    df["Valor"] = limpiar_columna_numerica(df["Valor"], 6)
+    df["Valor"] = limpiar_columna_numerica(df["Valor"])
+    df["Valor"] = df["Valor"].round(6)
 
     rename_map = {
         "Parametros": "PARAMETROS",
@@ -149,8 +167,12 @@ def cargar_seguro():
         print(f"[{tabla}] Hoja '{hoja}' vacía. No se insertan datos.")
         return
 
-    df["Cod. Ag."] = limpiar_columna_numerica(df["Cod. Ag."], None)
-    df["Seguro Caja"] = limpiar_columna_numerica(df["Seguro Caja"], None)
+    df["Cod. Ag."] = limpiar_columna_numerica(df["Cod. Ag."])
+    df["Seguro Caja"] = limpiar_columna_numerica(df["Seguro Caja"])
+
+    # Estos los dejamos como enteros (BIGINT en SQL)
+    df["Cod. Ag."] = df["Cod. Ag."].round(0).astype("Int64")
+    df["Seguro Caja"] = df["Seguro Caja"].round(0).astype("Int64")
 
     rename_map = {
         "AGENCIA_BASE": "AGENCIA_BASE",
