@@ -9,7 +9,7 @@ from sqlConn import sqlConn
 # ======================================================
 
 EXCEL_PATH = r"/home/leonardd/Plexus/BRITIMP/BaseParametrica_modelo_agencias.xlsx"
-PREDEF_CONN = "AT_CMDTS"   # conexión al AT de datos
+PREDEF_CONN = "AT_CMDTS"
 
 
 # ======================================================
@@ -17,14 +17,6 @@ PREDEF_CONN = "AT_CMDTS"   # conexión al AT de datos
 # ======================================================
 
 def limpiar_columna_numerica(serie, decimales=None):
-    """
-    Limpia texto y lo convierte a número:
-      - "" y "-" -> NULL
-      - quita "." de miles
-      - "," decimal -> "."
-      - errors='coerce' -> no numérico -> NaN
-      - redondea si se indican decimales
-    """
     serie = serie.astype(str).str.strip()
     serie = serie.replace({"": None, "-": None})
     serie = serie.str.replace(".", "", regex=False)
@@ -36,11 +28,11 @@ def limpiar_columna_numerica(serie, decimales=None):
 
 
 # ======================================================
-# HOJA: DATOS  -> PLXS_BASE_PARAMETRICA_MODELO_AGENCIAS_DATOS
+# HOJA: DATOS  -> PLXS_BASE_PARAMETRICA_MODELO_AGENCIA_DATOS
 # ======================================================
 
 def cargar_datos():
-    tabla = "PLXS_BASE_PARAMETRICA_MODELO_AGENCIAS_DATOS"
+    tabla = "PLXS_BASE_PARAMETRICA_MODELO_AGENCIA_DATOS"
     hoja = "Datos"
 
     df = pd.read_excel(EXCEL_PATH, sheet_name=hoja)
@@ -49,16 +41,14 @@ def cargar_datos():
         print(f"[{tabla}] Hoja '{hoja}' vacía. No se insertan datos.")
         return
 
-    # Limpiar y redondear columnas numéricas
     df["Milaje"] = limpiar_columna_numerica(df["Milaje"], 2)
     df["Precio Km"] = limpiar_columna_numerica(df["Precio Km"], 0)
     df["Kms"] = limpiar_columna_numerica(df["Kms"], 0)
     df["Costo KM"] = limpiar_columna_numerica(df["Costo KM"], 0)
 
-    # Renombrar columnas al esquema de la tabla
     rename_map = {
-        "Agencias_Transportadora": "AGENCIAS_TRANSPORTADORAS",
-        "Agencias_Transportadoras": "AGENCIAS_TRANSPORTADORAS",  # por si viene así
+        "Agencias_Transportadora": "AGENCIAS_TRANSPORTADORA",
+        "Agencias_Transportadoras": "AGENCIAS_TRANSPORTADORA",  # por si viene así
         "Agencia": "AGENCIA",
         "Proveedor": "PROVEEDOR",
         "Milaje": "MILAJE",
@@ -69,7 +59,7 @@ def cargar_datos():
     df = df.rename(columns=rename_map)
 
     columnas_finales = [
-        "AGENCIAS_TRANSPORTADORAS",
+        "AGENCIAS_TRANSPORTADORA",
         "AGENCIA",
         "PROVEEDOR",
         "MILAJE",
@@ -79,12 +69,10 @@ def cargar_datos():
     ]
     df = df[columnas_finales]
 
-    # FECHA_CREACION
     df["FECHA_CREACION"] = datetime.now()
 
     conn = sqlConn(predef_conn=PREDEF_CONN, agendado=False)
     try:
-        # usa el método interno de sqlConn que te pasó tu compañero
         try:
             conn.truncar_tabla(dataset_name=tabla, schema="dbo")
             print(f"[{tabla}] TRUNCATE OK")
@@ -101,11 +89,11 @@ def cargar_datos():
 
 
 # ======================================================
-# HOJA: PARAMETROS -> PLXS_BASE_PARAMETRICA_MODELO_AGENCIAS_PARAMETROS
+# HOJA: PARAMETROS -> PLXS_BASE_PARAMETRICA_MODELO_AGENCIA_PARAMETROS
 # ======================================================
 
 def cargar_parametros():
-    tabla = "PLXS_BASE_PARAMETRICA_MODELO_AGENCIAS_PARAMETROS"
+    tabla = "PLXS_BASE_PARAMETRICA_MODELO_AGENCIA_PARAMETROS"
     hoja = "Parametros"
 
     df = pd.read_excel(EXCEL_PATH, sheet_name=hoja)
@@ -114,7 +102,6 @@ def cargar_parametros():
         print(f"[{tabla}] Hoja '{hoja}' vacía. No se insertan datos.")
         return
 
-    # VALOR -> 6 decimales
     df["Valor"] = limpiar_columna_numerica(df["Valor"], 6)
 
     rename_map = {
@@ -149,11 +136,11 @@ def cargar_parametros():
 
 
 # ======================================================
-# HOJA: SEGURO -> PLXS_BASE_PARAMETRICA_MODELO_AGENCIAS_SEGURO
+# HOJA: SEGURO -> PLXS_BASE_PARAMETRICA_MODELO_AGENCIA_SEGURO
 # ======================================================
 
 def cargar_seguro():
-    tabla = "PLXS_BASE_PARAMETRICA_MODELO_AGENCIAS_SEGURO"
+    tabla = "PLXS_BASE_PARAMETRICA_MODELO_AGENCIA_SEGURO"
     hoja = "Seguro"
 
     df = pd.read_excel(EXCEL_PATH, sheet_name=hoja)
@@ -162,7 +149,6 @@ def cargar_seguro():
         print(f"[{tabla}] Hoja '{hoja}' vacía. No se insertan datos.")
         return
 
-    # Numéricos sin redondeo especial
     df["Cod. Ag."] = limpiar_columna_numerica(df["Cod. Ag."], None)
     df["Seguro Caja"] = limpiar_columna_numerica(df["Seguro Caja"], None)
 
