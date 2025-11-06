@@ -16,7 +16,7 @@ PREDEF_CONN = "AT_CMDTS"
 # HELPERS
 # ======================================================
 
-def limpiar_columna_numerica(serie: pd.Series, decimales: int | None = None) -> pd.Series:
+def limpiar_columna_numerica(serie, decimales=None):
     """
     Convierte una serie a numérico:
       - Quita espacios
@@ -36,9 +36,9 @@ def limpiar_columna_numerica(serie: pd.Series, decimales: int | None = None) -> 
     return serie
 
 
-def truncar_tabla(conn, tabla: str) -> None:
+def truncar_tabla(conn, tabla):
     """
-    Intenta TRUNCATE TABLE. Si falla, muestra el error y sigue el proceso.
+    Intenta TRUNCATE TABLE. Si falla, muestra el error y sigue.
     """
     try:
         sql = f"TRUNCATE TABLE {tabla}"
