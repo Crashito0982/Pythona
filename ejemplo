@@ -1,6 +1,7 @@
 import os
 from datetime import datetime
 
+import numpy as np
 import pandas as pd
 from sqlConn import sqlConn
 
@@ -10,10 +11,11 @@ from sqlConn import sqlConn
 
 EXCEL_PATH = r"/home/leonardd/Plexus/BRITIMP/BaseParametrica_modelo_agencias.xlsx"
 PREDEF_CONN = "AT_CMDTS"
+SCHEMA = "dbo"  # Cambiar si usás otro schema
 
 
 # ======================================================
-# HELPERS
+# HELPER PARA NÚMEROS EN FORMATO LATAM
 # ======================================================
 
 def parse_num_latam(serie):
@@ -32,7 +34,7 @@ def parse_num_latam(serie):
 
 
 # ======================================================
-# DATOS  -> PLXS_BASE_PARAMETRICA_MODELO_AGENCIA_DATOS
+# HOJA: DATOS -> PLXS_BASE_PARAMETRICA_MODELO_AGENCIA_DATOS
 # ======================================================
 
 def cargar_datos():
@@ -45,19 +47,22 @@ def cargar_datos():
         return
 
     # Parseo numérico
-    df["Milaje"] = parse_num_latam(df["Milaje"])
+    df["Milaje"]    = parse_num_latam(df["Milaje"])
     df["Precio Km"] = parse_num_latam(df["Precio Km"])
-    df["Kms"] = parse_num_latam(df["Kms"])
-    df["Costo KM"] = parse_num_latam(df["Costo KM"])
+    df["Kms"]       = parse_num_latam(df["Kms"])
+    df["Costo KM"]  = parse_num_latam(df["Costo KM"])
 
-    # Redondeos:
+    # Redondeos con np.round
     # MILAJE -> 2 decimales (para DECIMAL(18,2))
-    df["Milaje"] = df["Milaje"].round(2)
+    df["Milaje"] = df["Milaje"].apply(
+        lambda x: np.round(x, 2) if pd.notna(x) else x
+    )
 
     # PRECIO_KM, KMS, COSTO_KM -> 0 decimales (para DECIMAL(18,0))
-    df["Precio Km"] = df["Precio Km"].round(0)
-    df["Kms"] = df["Kms"].round(0)
-    df["Costo KM"] = df["Costo KM"].round(0)
+    for col in ["Precio Km", "Kms", "Costo KM"]:
+        df[col] = df[col].apply(
+            lambda x: np.round(x, 0) if pd.notna(x) else x
+        )
 
     # Renombrar columnas al esquema de la tabla
     rename_map = {
@@ -88,10 +93,10 @@ def cargar_datos():
     conn = sqlConn(predef_conn=PREDEF_CONN, agendado=False)
     try:
         try:
-            conn.truncar_tabla(dataset_name=tabla, schema="dbo")
+            conn.truncar_tabla(dataset_name=tabla, schema=SCHEMA)
             print(f"[{tabla}] TRUNCATE OK")
         except Exception as e:
-            print(f"[{tabla}] ERROR en TRUNCATE: {e}")
+            print(f"[{tabla}] ERROR en TRUNCATE (se sigue con insert): {e}")
 
         conn.crea_tabla(df, tabla, if_exists="append")
         print(f"[{tabla}] Insertados {len(df)} registros.")
@@ -103,7 +108,7 @@ def cargar_datos():
 
 
 # ======================================================
-# PARAMETROS -> PLXS_BASE_PARAMETRICA_MODELO_AGENCIA_PARAMETROS
+# HOJA: PARAMETROS -> PLXS_BASE_PARAMETRICA_MODELO_AGENCIA_PARAMETROS
 # ======================================================
 
 def cargar_parametros():
@@ -115,8 +120,11 @@ def cargar_parametros():
         print(f"[{tabla}] Hoja '{hoja}' vacía. No se insertan datos.")
         return
 
+    # Parseo + redondeo VALOR a 6 decimales
     df["Valor"] = parse_num_latam(df["Valor"])
-    df["Valor"] = df["Valor"].round(6)  # para DECIMAL(18,6)
+    df["Valor"] = df["Valor"].apply(
+        lambda x: np.round(x, 6) if pd.notna(x) else x
+    )  # para DECIMAL(18,6)
 
     rename_map = {
         "Parametros": "PARAMETROS",
@@ -135,10 +143,10 @@ def cargar_parametros():
     conn = sqlConn(predef_conn=PREDEF_CONN, agendado=False)
     try:
         try:
-            conn.truncar_tabla(dataset_name=tabla, schema="dbo")
+            conn.truncar_tabla(dataset_name=tabla, schema=SCHEMA)
             print(f"[{tabla}] TRUNCATE OK")
         except Exception as e:
-            print(f"[{tabla}] ERROR en TRUNCATE: {e}")
+            print(f"[{tabla}] ERROR en TRUNCATE (se sigue con insert): {e}")
 
         conn.crea_tabla(df, tabla, if_exists="append")
         print(f"[{tabla}] Insertados {len(df)} registros.")
@@ -150,7 +158,7 @@ def cargar_parametros():
 
 
 # ======================================================
-# SEGURO -> PLXS_BASE_PARAMETRICA_MODELO_AGENCIA_SEGURO
+# HOJA: SEGURO -> PLXS_BASE_PARAMETRICA_MODELO_AGENCIA_SEGURO
 # ======================================================
 
 def cargar_seguro():
@@ -162,8 +170,16 @@ def cargar_seguro():
         print(f"[{tabla}] Hoja '{hoja}' vacía. No se insertan datos.")
         return
 
-    df["Cod. Ag."] = parse_num_latam(df["Cod. Ag."]).round(0)
-    df["Seguro Caja"] = parse_num_latam(df["Seguro Caja"]).round(0)
+    df["Cod. Ag."]     = parse_num_latam(df["Cod. Ag."])
+    df["Seguro Caja"]  = parse_num_latam(df["Seguro Caja"])
+
+    # Redondeo a 0 decimales (para DECIMAL(18,0) o BIGINT)
+    df["Cod. Ag."] = df["Cod. Ag."].apply(
+        lambda x: np.round(x, 0) if pd.notna(x) else x
+    )
+    df["Seguro Caja"] = df["Seguro Caja"].apply(
+        lambda x: np.round(x, 0) if pd.notna(x) else x
+    )
 
     rename_map = {
         "AGENCIA_BASE": "AGENCIA_BASE",
@@ -186,10 +202,10 @@ def cargar_seguro():
     conn = sqlConn(predef_conn=PREDEF_CONN, agendado=False)
     try:
         try:
-            conn.truncar_tabla(dataset_name=tabla, schema="dbo")
+            conn.truncar_tabla(dataset_name=tabla, schema=SCHEMA)
             print(f"[{tabla}] TRUNCATE OK")
         except Exception as e:
-            print(f"[{tabla}] ERROR en TRUNCATE: {e}")
+            print(f"[{tabla}] ERROR en TRUNCATE (se sigue con insert): {e}")
 
         conn.crea_tabla(df, tabla, if_exists="append")
         print(f"[{tabla}] Insertados {len(df)} registros.")
