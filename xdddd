@@ -19,17 +19,23 @@ SCHEMA = "dbo"  # cambiar si usás otro schema
 
 def parse_num_latam(serie: pd.Series) -> pd.Series:
     """
-    Convierte texto con formato latino a número:
+    Convierte texto con formato latino a número.
+    NO toca las columnas que ya son numéricas (float/int).
+    Reglas para textos:
       - "" y "-" -> NULL
       - "." de miles se elimina: 6.800 -> 6800
       - "," decimal -> ".": 0,78 -> 0.78
     """
-    serie = serie.astype(str).str.strip()
-    serie = serie.replace({"": None, "-": None})
-    serie = serie.str.replace(".", "", regex=False)
-    serie = serie.str.replace(",", ".", regex=False)
-    serie = pd.to_numeric(serie, errors="coerce")
-    return serie
+    # Si ya es numérico, no tocamos nada
+    if pd.api.types.is_numeric_dtype(serie):
+        return pd.to_numeric(serie, errors="coerce")
+
+    # Si viene como texto, limpiamos formato LATAM
+    s = serie.astype(str).str.strip()
+    s = s.replace({"": None, "-": None})
+    s = s.str.replace(".", "", regex=False)
+    s = s.str.replace(",", ".", regex=False)
+    return pd.to_numeric(s, errors="coerce")
 
 
 # ======================================================
@@ -45,7 +51,7 @@ def cargar_datos():
         print(f"[{tabla}] Hoja '{hoja}' vacía. No se insertan datos.")
         return
 
-    # Parseo numérico básico (SIN redondeos extra)
+    # Parseo numérico (ahora SIN deformar los floats ya correctos)
     df["Milaje"]    = parse_num_latam(df["Milaje"])
     df["Precio Km"] = parse_num_latam(df["Precio Km"])
     df["Kms"]       = parse_num_latam(df["Kms"])
@@ -87,7 +93,7 @@ def cargar_datos():
         except Exception as e:
             print(f"[{tabla}] ERROR en TRUNCATE: {e}")
 
-        # Vuelco como antes (append sobre tabla ya vacía)
+        # Vuelco (append sobre tabla vacía)
         conn.crea_tabla(df, tabla, if_exists="append")
         print(f"[{tabla}] Insertados {len(df)} registros.")
     finally:
@@ -110,7 +116,6 @@ def cargar_parametros():
         print(f"[{tabla}] Hoja '{hoja}' vacía. No se insertan datos.")
         return
 
-    # Parseo numérico de VALOR (sin forzar tipo ni redondeo agresivo)
     df["Valor"] = parse_num_latam(df["Valor"])
 
     rename_map = {
@@ -157,7 +162,6 @@ def cargar_seguro():
         print(f"[{tabla}] Hoja '{hoja}' vacía. No se insertan datos.")
         return
 
-    # Parseo numérico
     df["Cod. Ag."]    = parse_num_latam(df["Cod. Ag."])
     df["Seguro Caja"] = parse_num_latam(df["Seguro Caja"])
 
