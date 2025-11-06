@@ -16,13 +16,12 @@ PREDEF_CONN = "AT_CMDTS"
 # HELPERS
 # ======================================================
 
-def limpiar_columna_numerica(serie):
+def parse_num_latam(serie):
     """
-    Quita formato y convierte a número:
+    Convierte texto con formato latino a número:
       - "" y "-" -> NULL
-      - quita "." de miles
-      - "," decimal -> "."
-      - errors='coerce' -> no numérico -> NaN
+      - "." de miles se elimina: 6.800 -> 6800
+      - "," decimal -> ".": 0,78 -> 0.78
     """
     serie = serie.astype(str).str.strip()
     serie = serie.replace({"": None, "-": None})
@@ -33,7 +32,7 @@ def limpiar_columna_numerica(serie):
 
 
 # ======================================================
-# HOJA: DATOS  -> PLXS_BASE_PARAMETRICA_MODELO_AGENCIA_DATOS
+# DATOS  -> PLXS_BASE_PARAMETRICA_MODELO_AGENCIA_DATOS
 # ======================================================
 
 def cargar_datos():
@@ -41,26 +40,24 @@ def cargar_datos():
     hoja = "Datos"
 
     df = pd.read_excel(EXCEL_PATH, sheet_name=hoja)
-
     if df.empty:
         print(f"[{tabla}] Hoja '{hoja}' vacía. No se insertan datos.")
         return
 
-    # Parsear numéricos
-    df["Milaje"] = limpiar_columna_numerica(df["Milaje"])
-    df["Precio Km"] = limpiar_columna_numerica(df["Precio Km"])
-    df["Kms"] = limpiar_columna_numerica(df["Kms"])
-    df["Costo KM"] = limpiar_columna_numerica(df["Costo KM"])
+    # Parseo numérico
+    df["Milaje"] = parse_num_latam(df["Milaje"])
+    df["Precio Km"] = parse_num_latam(df["Precio Km"])
+    df["Kms"] = parse_num_latam(df["Kms"])
+    df["Costo KM"] = parse_num_latam(df["Costo KM"])
 
     # Redondeos:
-    # MILAJE -> 2 decimales
+    # MILAJE -> 2 decimales (para DECIMAL(10,2))
     df["Milaje"] = df["Milaje"].round(2)
 
-    # PRECIO_KM, KMS, COSTO_KM -> sin decimales (enteros)
-    for col in ["Precio Km", "Kms", "Costo KM"]:
-        df[col] = df[col].round(0)
-        # Entero nullable (para soportar NaN)
-        df[col] = df[col].astype("Int64")
+    # PRECIO_KM, KMS, COSTO_KM -> 0 decimales (para DECIMAL(10,0))
+    df["Precio Km"] = df["Precio Km"].round(0)
+    df["Kms"] = df["Kms"].round(0)
+    df["Costo KM"] = df["Costo KM"].round(0)
 
     # Renombrar columnas al esquema de la tabla
     rename_map = {
@@ -106,7 +103,7 @@ def cargar_datos():
 
 
 # ======================================================
-# HOJA: PARAMETROS -> PLXS_BASE_PARAMETRICA_MODELO_AGENCIA_PARAMETROS
+# PARAMETROS -> PLXS_BASE_PARAMETRICA_MODELO_AGENCIA_PARAMETROS
 # ======================================================
 
 def cargar_parametros():
@@ -114,13 +111,12 @@ def cargar_parametros():
     hoja = "Parametros"
 
     df = pd.read_excel(EXCEL_PATH, sheet_name=hoja)
-
     if df.empty:
         print(f"[{tabla}] Hoja '{hoja}' vacía. No se insertan datos.")
         return
 
-    df["Valor"] = limpiar_columna_numerica(df["Valor"])
-    df["Valor"] = df["Valor"].round(6)
+    df["Valor"] = parse_num_latam(df["Valor"])
+    df["Valor"] = df["Valor"].round(6)  # para DECIMAL(10,6)
 
     rename_map = {
         "Parametros": "PARAMETROS",
@@ -148,13 +144,14 @@ def cargar_parametros():
         print(f"[{tabla}] Insertados {len(df)} registros.")
     finally:
         try:
-            conn.desconecta()
+            conn.desconecta():
+                pass
         except Exception:
             pass
 
 
 # ======================================================
-# HOJA: SEGURO -> PLXS_BASE_PARAMETRICA_MODELO_AGENCIA_SEGURO
+# SEGURO -> PLXS_BASE_PARAMETRICA_MODELO_AGENCIA_SEGURO
 # ======================================================
 
 def cargar_seguro():
@@ -162,17 +159,12 @@ def cargar_seguro():
     hoja = "Seguro"
 
     df = pd.read_excel(EXCEL_PATH, sheet_name=hoja)
-
     if df.empty:
         print(f"[{tabla}] Hoja '{hoja}' vacía. No se insertan datos.")
         return
 
-    df["Cod. Ag."] = limpiar_columna_numerica(df["Cod. Ag."])
-    df["Seguro Caja"] = limpiar_columna_numerica(df["Seguro Caja"])
-
-    # Estos los dejamos como enteros (BIGINT en SQL)
-    df["Cod. Ag."] = df["Cod. Ag."].round(0).astype("Int64")
-    df["Seguro Caja"] = df["Seguro Caja"].round(0).astype("Int64")
+    df["Cod. Ag."] = parse_num_latam(df["Cod. Ag."]).round(0)
+    df["Seguro Caja"] = parse_num_latam(df["Seguro Caja"]).round(0)
 
     rename_map = {
         "AGENCIA_BASE": "AGENCIA_BASE",
