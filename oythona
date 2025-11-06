@@ -9,7 +9,7 @@ from sqlConn import sqlConn
 # ======================================================
 
 EXCEL_PATH = r"/home/leonardd/Plexus/BRITIMP/BaseParametrica_modelo_agencias.xlsx"
-PREDEF_CONN = "AT_CMDTS"
+PREDEF_CONN = "AT_CMDTS"   # conexión al AT de datos
 
 
 # ======================================================
@@ -18,13 +18,12 @@ PREDEF_CONN = "AT_CMDTS"
 
 def limpiar_columna_numerica(serie, decimales=None):
     """
-    Convierte una serie a numérico:
-      - Quita espacios
-      - Convierte "" y "-" a NULL
-      - Quita separador de miles "."
-      - Convierte coma decimal "," a "."
-      - Convierte a número (no numérico -> NaN)
-      - Aplica redondeo si se indica
+    Limpia texto y lo convierte a número:
+      - "" y "-" -> NULL
+      - quita "." de miles
+      - "," decimal -> "."
+      - errors='coerce' -> no numérico -> NaN
+      - redondea si se indican decimales
     """
     serie = serie.astype(str).str.strip()
     serie = serie.replace({"": None, "-": None})
@@ -34,22 +33,6 @@ def limpiar_columna_numerica(serie, decimales=None):
     if decimales is not None:
         serie = serie.round(decimales)
     return serie
-
-
-def truncar_tabla(conn, tabla):
-    """
-    Intenta TRUNCATE TABLE. Si falla, muestra el error y sigue.
-    """
-    try:
-        sql = f"TRUNCATE TABLE {tabla}"
-        conn.cnxn.execute(sql)
-        try:
-            conn.cnxn.commit()
-        except Exception:
-            pass
-        print(f"[{tabla}] TRUNCATE OK")
-    except Exception as e:
-        print(f"[{tabla}] ERROR en TRUNCATE: {e}")
 
 
 # ======================================================
@@ -85,7 +68,6 @@ def cargar_datos():
     }
     df = df.rename(columns=rename_map)
 
-    # Seleccionar columnas en el orden esperado
     columnas_finales = [
         "AGENCIAS_TRANSPORTADORAS",
         "AGENCIA",
@@ -97,12 +79,18 @@ def cargar_datos():
     ]
     df = df[columnas_finales]
 
-    # Agregar FECHA_CREACION
+    # FECHA_CREACION
     df["FECHA_CREACION"] = datetime.now()
 
     conn = sqlConn(predef_conn=PREDEF_CONN, agendado=False)
     try:
-        truncar_tabla(conn, tabla)
+        # usa el método interno de sqlConn que te pasó tu compañero
+        try:
+            conn.truncar_tabla(dataset_name=tabla, schema="dbo")
+            print(f"[{tabla}] TRUNCATE OK")
+        except Exception as e:
+            print(f"[{tabla}] ERROR en TRUNCATE: {e}")
+
         conn.crea_tabla(df, tabla, if_exists="append")
         print(f"[{tabla}] Insertados {len(df)} registros.")
     finally:
@@ -126,10 +114,9 @@ def cargar_parametros():
         print(f"[{tabla}] Hoja '{hoja}' vacía. No se insertan datos.")
         return
 
-    # Limpiar y redondear VALOR (6 decimales)
+    # VALOR -> 6 decimales
     df["Valor"] = limpiar_columna_numerica(df["Valor"], 6)
 
-    # Renombrar columnas
     rename_map = {
         "Parametros": "PARAMETROS",
         "Valor": "VALOR",
@@ -146,7 +133,12 @@ def cargar_parametros():
 
     conn = sqlConn(predef_conn=PREDEF_CONN, agendado=False)
     try:
-        truncar_tabla(conn, tabla)
+        try:
+            conn.truncar_tabla(dataset_name=tabla, schema="dbo")
+            print(f"[{tabla}] TRUNCATE OK")
+        except Exception as e:
+            print(f"[{tabla}] ERROR en TRUNCATE: {e}")
+
         conn.crea_tabla(df, tabla, if_exists="append")
         print(f"[{tabla}] Insertados {len(df)} registros.")
     finally:
@@ -170,11 +162,10 @@ def cargar_seguro():
         print(f"[{tabla}] Hoja '{hoja}' vacía. No se insertan datos.")
         return
 
-    # Limpiar numéricos (sin redondeo especial)
+    # Numéricos sin redondeo especial
     df["Cod. Ag."] = limpiar_columna_numerica(df["Cod. Ag."], None)
     df["Seguro Caja"] = limpiar_columna_numerica(df["Seguro Caja"], None)
 
-    # Renombrar columnas
     rename_map = {
         "AGENCIA_BASE": "AGENCIA_BASE",
         "Cod. Ag.": "COD_AG",
@@ -195,7 +186,12 @@ def cargar_seguro():
 
     conn = sqlConn(predef_conn=PREDEF_CONN, agendado=False)
     try:
-        truncar_tabla(conn, tabla)
+        try:
+            conn.truncar_tabla(dataset_name=tabla, schema="dbo")
+            print(f"[{tabla}] TRUNCATE OK")
+        except Exception as e:
+            print(f"[{tabla}] ERROR en TRUNCATE: {e}")
+
         conn.crea_tabla(df, tabla, if_exists="append")
         print(f"[{tabla}] Insertados {len(df)} registros.")
     finally:
