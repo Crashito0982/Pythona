@@ -1,0 +1,83 @@
+def truncar_tabla(conn_, table_name: str) -> None:
+    """
+    Ejecuta TRUNCATE TABLE usando el atributo 'cnxn' de sqlConn.
+    NO atrapa la excepción: si falla, deja que reviente el proceso.
+    """
+    sql = f"TRUNCATE TABLE {table_name}"
+    print(f"Ejecutando: {sql}")
+    conn_.cnxn.execute(sql)
+    # Si la conexión no está en autocommit, hacemos commit
+    try:
+        conn_.cnxn.commit()
+    except Exception:
+        pass
+    print(f"TRUNCATE TABLE {table_name} OK")
+
+
+
+
+def cargar_hoja_y_poblar_tabla(sheet_name: str, cfg: Dict) -> None:
+    """
+    Lee la hoja 'sheet_name', arma el DataFrame final con los nombres correctos,
+    trunca la tabla destino y hace INSERT (append) de los datos.
+    Además muestra COUNT(*) antes y después para que puedas verificar.
+    """
+    table_name = cfg["table"]
+    print(f"\n=== Procesando hoja '{sheet_name}' -> tabla '{table_name}' ===")
+
+    # 1) Leer hoja del Excel
+    try:
+        df_raw = pd.read_excel(EXCEL_PATH, sheet_name=sheet_name)
+    except Exception as e:
+        raise RuntimeError(f"No se pudo leer la hoja '{sheet_name}' del Excel: {e}")
+
+    if df_raw.empty:
+        raise ValueError(f"La hoja '{sheet_name}' está vacía; no se poblará la tabla '{table_name}'.")
+
+    # 2) Construir DataFrame final (limpieza, redondeos, mapeo columnas, FECHA_CREACION)
+    df_final = construir_dataframe_final(df_raw, sheet_name, cfg)
+    print(f"DataFrame final para '{table_name}' listo. Forma: {df_final.shape}")
+
+    # 3) Conexión
+    print(f"Conectando a la BD con predef_conn='{PREDEF_CONN}'...")
+    conn_ = sqlConn(predef_conn=PREDEF_CONN, agendado=False)
+
+    try:
+        # CONTADOR ANTES
+        try:
+            count_antes = conn_.cnxn.execute(f"SELECT COUNT(*) FROM {table_name}").fetchone()[0]
+        except Exception as e:
+            print(f"[WARN] No se pudo obtener COUNT(*) antes de TRUNCATE en {table_name}: {e}")
+            count_antes = None
+
+        print(f"Registros en '{table_name}' ANTES de TRUNCATE: {count_antes}")
+
+        # 4) TRUNCATE TABLE (si falla, revienta aquí y NO sigue)
+        truncar_tabla(conn_, table_name)
+
+        # CONTADOR DESPUÉS DE TRUNCATE
+        try:
+            count_trunc = conn_.cnxn.execute(f"SELECT COUNT(*) FROM {table_name}").fetchone()[0]
+        except Exception as e:
+            print(f"[WARN] No se pudo obtener COUNT(*) después de TRUNCATE en {table_name}: {e}")
+            count_trunc = None
+
+        print(f"Registros en '{table_name}' DESPUÉS de TRUNCATE: {count_trunc}")
+
+        # 5) INSERT (append)
+        conn_.crea_tabla(df_final, table_name, if_exists="append")
+
+        # CONTADOR DESPUÉS DEL INSERT
+        try:
+            count_final = conn_.cnxn.execute(f"SELECT COUNT(*) FROM {table_name}").fetchone()[0]
+        except Exception as e:
+            print(f"[WARN] No se pudo obtener COUNT(*) después del INSERT en {table_name}: {e}")
+            count_final = None
+
+        print(f"Registros en '{table_name}' DESPUÉS del INSERT: {count_final}")
+
+    finally:
+        try:
+            conn_.desconecta()
+        except Exception:
+            pass
