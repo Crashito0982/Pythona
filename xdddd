@@ -1,0 +1,215 @@
+import os
+from datetime import datetime
+
+import pandas as pd
+from sqlConn import sqlConn
+
+# ======================================================
+# CONFIGURACIÓN
+# ======================================================
+
+EXCEL_PATH = r"/home/leonardd/Plexus/BRITIMP/BaseParametrica_modelo_agencias.xlsx"
+PREDEF_CONN = "AT_CMDTS"
+SCHEMA = "dbo"  # cambiar si usás otro schema
+
+
+# ======================================================
+# HELPER: NÚMEROS EN FORMATO LATAM
+# ======================================================
+
+def parse_num_latam(serie: pd.Series) -> pd.Series:
+    """
+    Convierte texto con formato latino a número:
+      - "" y "-" -> NULL
+      - "." de miles se elimina: 6.800 -> 6800
+      - "," decimal -> ".": 0,78 -> 0.78
+    """
+    serie = serie.astype(str).str.strip()
+    serie = serie.replace({"": None, "-": None})
+    serie = serie.str.replace(".", "", regex=False)
+    serie = serie.str.replace(",", ".", regex=False)
+    serie = pd.to_numeric(serie, errors="coerce")
+    return serie
+
+
+# ======================================================
+# HOJA: DATOS -> PLXS_BASE_PARAMETRICA_MODELO_AGENCIA_DATOS
+# ======================================================
+
+def cargar_datos():
+    tabla = "PLXS_BASE_PARAMETRICA_MODELO_AGENCIA_DATOS"
+    hoja = "Datos"
+
+    df = pd.read_excel(EXCEL_PATH, sheet_name=hoja)
+    if df.empty:
+        print(f"[{tabla}] Hoja '{hoja}' vacía. No se insertan datos.")
+        return
+
+    # Parseo numérico básico (SIN redondeos extra)
+    df["Milaje"]    = parse_num_latam(df["Milaje"])
+    df["Precio Km"] = parse_num_latam(df["Precio Km"])
+    df["Kms"]       = parse_num_latam(df["Kms"])
+    df["Costo KM"]  = parse_num_latam(df["Costo KM"])
+
+    # Renombrar columnas al esquema final
+    rename_map = {
+        "Agencias_Transportadora": "AGENCIAS_TRANSPORTADORA",
+        "Agencias_Transportadoras": "AGENCIAS_TRANSPORTADORA",  # por si viene así
+        "Agencia": "AGENCIA",
+        "Proveedor": "PROVEEDOR",
+        "Milaje": "MILAJE",
+        "Precio Km": "PRECIO_KM",
+        "Kms": "KMS",
+        "Costo KM": "COSTO_KM",
+    }
+    df = df.rename(columns=rename_map)
+
+    columnas_finales = [
+        "AGENCIAS_TRANSPORTADORA",
+        "AGENCIA",
+        "PROVEEDOR",
+        "MILAJE",
+        "PRECIO_KM",
+        "KMS",
+        "COSTO_KM",
+    ]
+    df = df[columnas_finales]
+
+    # FECHA_CREACION
+    df["FECHA_CREACION"] = datetime.now()
+
+    conn = sqlConn(predef_conn=PREDEF_CONN, agendado=False)
+    try:
+        # TRUNCATE usando el método de sqlConn
+        try:
+            conn.truncar_tabla(dataset_name=tabla, schema=SCHEMA)
+            print(f"[{tabla}] TRUNCATE OK")
+        except Exception as e:
+            print(f"[{tabla}] ERROR en TRUNCATE: {e}")
+
+        # Vuelco como antes (append sobre tabla ya vacía)
+        conn.crea_tabla(df, tabla, if_exists="append")
+        print(f"[{tabla}] Insertados {len(df)} registros.")
+    finally:
+        try:
+            conn.desconecta()
+        except Exception:
+            pass
+
+
+# ======================================================
+# HOJA: PARAMETROS -> PLXS_BASE_PARAMETRICA_MODELO_AGENCIA_PARAMETROS
+# ======================================================
+
+def cargar_parametros():
+    tabla = "PLXS_BASE_PARAMETRICA_MODELO_AGENCIA_PARAMETROS"
+    hoja = "Parametros"
+
+    df = pd.read_excel(EXCEL_PATH, sheet_name=hoja)
+    if df.empty:
+        print(f"[{tabla}] Hoja '{hoja}' vacía. No se insertan datos.")
+        return
+
+    # Parseo numérico de VALOR (sin forzar tipo ni redondeo agresivo)
+    df["Valor"] = parse_num_latam(df["Valor"])
+
+    rename_map = {
+        "Parametros": "PARAMETROS",
+        "Valor": "VALOR",
+    }
+    df = df.rename(columns=rename_map)
+
+    columnas_finales = [
+        "PARAMETROS",
+        "VALOR",
+    ]
+    df = df[columnas_finales]
+
+    df["FECHA_CREACION"] = datetime.now()
+
+    conn = sqlConn(predef_conn=PREDEF_CONN, agendado=False)
+    try:
+        try:
+            conn.truncar_tabla(dataset_name=tabla, schema=SCHEMA)
+            print(f"[{tabla}] TRUNCATE OK")
+        except Exception as e:
+            print(f"[{tabla}] ERROR en TRUNCATE: {e}")
+
+        conn.crea_tabla(df, tabla, if_exists="append")
+        print(f"[{tabla}] Insertados {len(df)} registros.")
+    finally:
+        try:
+            conn.desconecta()
+        except Exception:
+            pass
+
+
+# ======================================================
+# HOJA: SEGURO -> PLXS_BASE_PARAMETRICA_MODELO_AGENCIA_SEGURO
+# ======================================================
+
+def cargar_seguro():
+    tabla = "PLXS_BASE_PARAMETRICA_MODELO_AGENCIA_SEGURO"
+    hoja = "Seguro"
+
+    df = pd.read_excel(EXCEL_PATH, sheet_name=hoja)
+    if df.empty:
+        print(f"[{tabla}] Hoja '{hoja}' vacía. No se insertan datos.")
+        return
+
+    # Parseo numérico
+    df["Cod. Ag."]    = parse_num_latam(df["Cod. Ag."])
+    df["Seguro Caja"] = parse_num_latam(df["Seguro Caja"])
+
+    rename_map = {
+        "AGENCIA_BASE": "AGENCIA_BASE",
+        "Cod. Ag.": "COD_AG",
+        "Agencia": "AGENCIA",
+        "Seguro Caja": "SEGURO_CAJA",
+    }
+    df = df.rename(columns=rename_map)
+
+    columnas_finales = [
+        "AGENCIA_BASE",
+        "COD_AG",
+        "AGENCIA",
+        "SEGURO_CAJA",
+    ]
+    df = df[columnas_finales]
+
+    df["FECHA_CREACION"] = datetime.now()
+
+    conn = sqlConn(predef_conn=PREDEF_CONN, agendado=False)
+    try:
+        try:
+            conn.truncar_tabla(dataset_name=tabla, schema=SCHEMA)
+            print(f"[{tabla}] TRUNCATE OK")
+        except Exception as e:
+            print(f"[{tabla}] ERROR en TRUNCATE: {e}")
+
+        conn.crea_tabla(df, tabla, if_exists="append")
+        print(f"[{tabla}] Insertados {len(df)} registros.")
+    finally:
+        try:
+            conn.desconecta()
+        except Exception:
+            pass
+
+
+# ======================================================
+# ORQUESTADOR
+# ======================================================
+
+def run():
+    if not os.path.isfile(EXCEL_PATH):
+        raise FileNotFoundError(f"No se encontró el Excel en: {EXCEL_PATH}")
+
+    print("Iniciando carga de base paramétrica (AT_CMDTS, con TRUNCATE + APPEND)...")
+    cargar_datos()
+    cargar_parametros()
+    cargar_seguro()
+    print("Proceso finalizado.")
+
+
+if __name__ == "__main__":
+    run()
