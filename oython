@@ -1,0 +1,208 @@
+import os
+from datetime import datetime
+from typing import Dict, List
+
+import pandas as pd
+from pandas.api.types import is_numeric_dtype
+from sqlConn import sqlConn
+import re
+
+# ======================================================================
+# CONFIGURACIÓN
+# ======================================================================
+# MODO:
+#   "AT"    -> pruebas en Jupyter apuntando a AT_CMDTS
+#   "ODSPE" -> producción en ODSPE / Airflow
+MODO = "AT"  # cambiar a "ODSPE" cuando pases a producción
+
+if MODO == "AT":
+    # Ruta local (ejemplo) para Jupyter
+    EXCEL_PATH = r"/home/leonardd/Plexus/BRITIMP/BaseParametrica_modelo_agencias.xlsx"
+    PREDEF_CONN = "AT_CMDTS"
+else:
+    # Ruta en el ambiente de Airflow / ODSPE
+    EXCEL_PATH = r"//nfs_airflow_py/cmdat/ea-saa-datos/Transportadoras/Britimp/BaseParametrica_modelo_agencias.xlsx"
+    PREDEF_CONN = "ODSPE"   # ajustar al nombre real de la conexión en sqlConn
+
+# Nombres de tablas finales (tal como las creaste en ODSPE)
+SHEET_TO_TABLE: Dict[str, str] = {
+    "Datos": "PLXS_BASE_PARAMETRICA_MODELO_AGENCIAS_DATOS",
+    "Seguro": "PLXS_BASE_PARAMETRICA_MODELO_AGENCIAS_SEGURO",
+    "Parametros": "PLXS_BASE_PARAMETRICA_MODELO_AGENCIAS_PARAMETROS",
+}
+
+# Columnas numéricas por hoja (nombres tal como vienen en el Excel)
+NUMERIC_COLS: Dict[str, List[str]] = {
+    "Datos": ["Milaje", "Precio Km", "Kms", "Costo KM"],
+    "Seguro": ["Cod. Ag.", "Seguro Caja"],
+    "Parametros": ["Valor"],
+}
+
+
+# ======================================================================
+# HELPERS
+# ======================================================================
+def normalize_column_name(col: str) -> str:
+    """
+    Normaliza nombres de columnas:
+      - Mayúsculas
+      - Reemplaza cualquier cosa que no sea A-Z o 0-9 por "_"
+      - Quita "_" sobrantes al inicio/fin
+
+    Ej:
+      "Cod. Ag."    -> "COD_AG"
+      "Seguro Caja" -> "SEGURO_CAJA"
+    """
+    col = col.strip().upper()
+    col = re.sub(r"[^A-Z0-9]+", "_", col)
+    col = col.strip("_")
+    return col
+
+
+def clean_and_round_numeric(df: pd.DataFrame, sheet_name: str) -> pd.DataFrame:
+    """
+    Limpia y redondea las columnas numéricas según la hoja:
+
+    - General:
+        * Quita separadores de miles "."
+        * Reemplaza coma decimal "," por "."
+        * Convierte a numeric con errors='coerce' => valores no numéricos -> NaN (NULL)
+
+    - Hoja 'Datos' (tabla PLXS_BASE_PARAMETRICA_MODELO_AGENCIAS_DATOS):
+        * MILAJE      -> 2 decimales
+        * PRECIO_KM   -> 0 decimales
+        * KMS         -> 0 decimales
+        * COSTO_KM    -> 0 decimales
+
+    - Hoja 'Parametros' (tabla PLXS_BASE_PARAMETRICA_MODELO_AGENCIAS_PARAMETROS):
+        * VALOR       -> 6 decimales
+
+    - Hoja 'Seguro' (tabla PLXS_BASE_PARAMETRICA_MODELO_AGENCIAS_SEGURO):
+        * Solo conversión a numérico (sin redondeo especial).
+    """
+    numeric_cols = NUMERIC_COLS.get(sheet_name, [])
+
+    for original_col in numeric_cols:
+        if original_col not in df.columns:
+            print(f"[WARN] Columna numérica '{original_col}' no encontrada en hoja '{sheet_name}'.")
+            continue
+
+        serie = df[original_col]
+
+        # Si ya es numérica, la tomamos tal cual; si no, la limpiamos
+        if not is_numeric_dtype(serie):
+            serie = serie.astype(str).str.strip()
+            # Valores "vacíos"
+            serie = serie.replace({"": None, "-": None})
+            # 7.171,69 -> 7171.69
+            serie = serie.str.replace(".", "", regex=False)
+            serie = serie.str.replace(",", ".", regex=False)
+            serie = pd.to_numeric(serie, errors="coerce")
+
+        # Aplicar redondeos según hoja/columna
+        if sheet_name == "Datos":
+            # OJO: acá usamos los nombres tal como vienen del Excel
+            if original_col == "Milaje":
+                serie = serie.round(2)
+            elif original_col in ("Precio Km", "Kms", "Costo KM"):
+                serie = serie.round(0)
+        elif sheet_name == "Parametros":
+            if original_col == "Valor":
+                serie = serie.round(6)
+
+        df[original_col] = serie
+
+    return df
+
+
+def truncar_tabla(conn_, table_name: str) -> None:
+    """
+    Lanza un TRUNCATE TABLE sobre la tabla destino.
+
+    IMPORTANTE:
+      - Esta función asume que sqlConn tiene un método 'ejecuta' que permite
+        ejecutar SQL crudo. Si en tu implementación se llama distinto
+        (por ejemplo 'ejecuta_sql', 'run_query', etc.), cambiá la línea de abajo.
+    """
+    sql = f"TRUNCATE TABLE {table_name}"
+    print(f"Truncando tabla '{table_name}'...")
+    conn_.ejecuta(sql)  # Ajustar si el método se llama distinto en tu sqlConn
+
+
+def cargar_hoja_y_poblar_tabla(sheet_name: str, table_name: str) -> None:
+    """
+    Lee la hoja 'sheet_name' del Excel, limpia/redondea numéricos,
+    normaliza nombres de columnas, agrega FECHA_CREACION, trunca la tabla
+    y hace INSERT (append) en la tabla destino.
+    """
+    print(f"\n=== Procesando hoja '{sheet_name}' -> tabla '{table_name}' ===")
+
+    # Leer hoja de Excel
+    try:
+        df = pd.read_excel(EXCEL_PATH, sheet_name=sheet_name)
+    except Exception as e:
+        raise RuntimeError(f"No se pudo leer la hoja '{sheet_name}' del Excel: {e}")
+
+    if df.empty:
+        raise ValueError(f"La hoja '{sheet_name}' está vacía, no se poblará la tabla '{table_name}'.")
+
+    # Limpieza y redondeo numérico según hoja
+    df = clean_and_round_numeric(df, sheet_name)
+
+    # Normalizar nombres de columnas para que coincidan con las tablas en ODSPE:
+    #   DATOS:      AGENCIAS_TRANSPORTADORAS, AGENCIA, PROVEEDOR, MILAJE, PRECIO_KM, KMS, COSTO_KM, FECHA_CREACION
+    #   PARAMETROS: PARAMETROS, VALOR, FECHA_CREACION
+    #   SEGURO:     AGENCIA_BASE, COD_AG, AGENCIA, SEGURO_CAJA, FECHA_CREACION
+    df.columns = [normalize_column_name(c) for c in df.columns]
+
+    # Agregamos FECHA_CREACION al final
+    df["FECHA_CREACION"] = datetime.now()
+
+    print(f"DataFrame hoja '{sheet_name}' listo para volcado. Forma: {df.shape}")
+
+    # Conexión a BD (AT_CMDTS u ODSPE según PREDEF_CONN)
+    print(f"Conectando a la BD usando predef_conn='{PREDEF_CONN}'...")
+    conn_ = sqlConn(predef_conn=PREDEF_CONN, agendado=False)
+
+    try:
+        # 1) TRUNCAR TABLA
+        truncar_tabla(conn_, table_name)
+
+        # 2) INSERTAR (append)
+        conn_.crea_tabla(df, table_name, if_exists="append")
+        print(f"Tabla '{table_name}' poblada con {len(df)} registros (TRUNCATE + INSERT).")
+
+    finally:
+        try:
+            conn_.desconecta()
+        except Exception:
+            pass
+
+
+# ======================================================================
+# ORQUESTADOR
+# ======================================================================
+def run() -> None:
+    """
+    Carga las 3 hojas de BaseParametrica_modelo_agencias.xlsx
+    en la BD indicada (AT_CMDTS u ODSPE), truncando previamente
+    las tablas destino y luego insertando los datos limpios.
+    """
+    print("=" * 70)
+    print(f"INICIO PROCESO BASE PARAMETRICA - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    print(f"MODO: {MODO}")
+    print(f"Archivo origen: {EXCEL_PATH}")
+    print("=" * 70)
+
+    if not os.path.isfile(EXCEL_PATH):
+        raise FileNotFoundError(f"No se encontró el archivo Excel en la ruta: {EXCEL_PATH}")
+
+    for sheet_name, table_name in SHEET_TO_TABLE.items():
+        cargar_hoja_y_poblar_tabla(sheet_name, table_name)
+
+    print("\nPROCESO BASE PARAMETRICA FINALIZADO CORRECTAMENTE.")
+    print("=" * 70)
+
+
+if __name__ == "__main__":
+    run()
