@@ -51,11 +51,14 @@ def cargar_datos():
         print(f"[{tabla}] Hoja '{hoja}' vacía. No se insertan datos.")
         return
 
-    # Parseo numérico (ahora SIN deformar los floats ya correctos)
+    # Parseo numérico
     df["Milaje"]    = parse_num_latam(df["Milaje"])
     df["Precio Km"] = parse_num_latam(df["Precio Km"])
     df["Kms"]       = parse_num_latam(df["Kms"])
     df["Costo KM"]  = parse_num_latam(df["Costo KM"])
+
+    # 🔹 Redondear MILAJE a 2 decimales
+    df["Milaje"] = df["Milaje"].round(2)
 
     # Renombrar columnas al esquema final
     rename_map = {
@@ -81,7 +84,6 @@ def cargar_datos():
     ]
     df = df[columnas_finales]
 
-    # FECHA_CREACION
     df["FECHA_CREACION"] = datetime.now()
 
     conn = sqlConn(predef_conn=PREDEF_CONN, agendado=False)
@@ -93,7 +95,6 @@ def cargar_datos():
         except Exception as e:
             print(f"[{tabla}] ERROR en TRUNCATE: {e}")
 
-        # Vuelco (append sobre tabla vacía)
         conn.crea_tabla(df, tabla, if_exists="append")
         print(f"[{tabla}] Insertados {len(df)} registros.")
     finally:
@@ -117,6 +118,9 @@ def cargar_parametros():
         return
 
     df["Valor"] = parse_num_latam(df["Valor"])
+
+    # 🔹 Redondear VALOR a 6 decimales
+    df["Valor"] = df["Valor"].round(6)
 
     rename_map = {
         "Parametros": "PARAMETROS",
