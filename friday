@@ -1,49 +1,56 @@
 # -*- coding: utf-8 -*-
 """
-BRITIMP - Consolidador v9 (estructura nueva de PROCESADO y PENDIENTES)
+BRITIMP - Consolidador v9 (estructura nueva de PROCESADO + SALDO ANTERIOR)
 -------------------------------------------------------------------------------
-Versión basada en el script robusto original (Gemini) con estos ajustes:
+Versión basada en el script robusto original con estos ajustes:
 
-- Estructura de carpetas:
-  * PENDIENTES = carpeta ROOT (por ejemplo 'BRITIMP'), con subcarpetas:
+Estructura de carpetas:
+  - PENDIENTES = carpeta ROOT (por ejemplo 'BRITIMP'), con subcarpetas:
       ASU/, CDE/, ENC/, OVD/  -> pendientes.
-  * PROCESADO/AAAA-MM-DD/AGENCIA/  -> copia del original + archivo renombrado
-    con sufijo _OK o _ERROR.
-  * CONSOLIDADO/AAAA-MM-DD/BRITIMP_*.csv  -> se mantiene igual.
+  - PROCESADO/AAAA-MM-DD/AGENCIA/  -> archivo original + archivo resultado
+    con sufijo _PROCESADO.
+  - CONSOLIDADO/AAAA-MM-DD/BRITIMP_*.csv  -> se mantiene igual.
 
-- Validación inicial:
-  * Si alguna de las carpetas de agencia (ASU, CDE, ENC, OVD) no existe o está
-    vacía (sin archivos .xlsx/.xls/.pdf), se loguea el error y NO se procesa
-    nada.
+Validación inicial:
+  - Si alguna de las carpetas de agencia (ASU, CDE, ENC, OVD) no existe o está
+    vacía (sin .xlsx/.xls/.pdf), se loguea el error y NO se procesa nada.
 
-- Logging:
-  * Se agrega un mensaje explícito cuando un parser se ejecuta pero no genera
-    registros: "[SIN REGISTROS] 'archivo' no generó registros para el tipo X".
-  * Se mantiene el log existente cuando se detecta "SIN MOVIMIENTOS" en el
-    contenido del archivo.
+SALDO ANTERIOR:
+  - EC_BULTO_ATM:
+      Se busca la fila 'SALDO ANTERIOR' y se extraen 4 números:
+        [bultos_pyg, saldo_pyg, bultos_usd, saldo_usd]
+      Se agregan columnas SALDO_ANTERIOR_PYG y SALDO_ANTERIOR_USD al consolidado.
+  - EC_EFECT_ATM:
+      En la fila 'SALDO ANTERIOR', el 1er número a la derecha es USD,
+      el 2º es PYG. Se agregan SALDO_ANTERIOR_PYG y SALDO_ANTERIOR_USD.
+  - EC_EFECT_BCO:
+      En la fila 'SALDO ANTERIOR', el 1er número a la derecha es el saldo
+      anterior (en la moneda del archivo). Se agrega columna SALDO_ANTERIOR.
 
-- Parsers y lógica de detección:
-  * Se mantiene la lógica detallada del v9 original para:
-    - dispatch_tipo (por nombre + contenido),
-    - detect_cliente_itau (descarta otros bancos),
-    - parsers EC_EFECT_BCO, EC_EFECT_ATM, EC_BULTO_ATM, INV_BILLETES_*,
-      evitando la simplificación que hacía que se salten archivos.
+RAW POR ARCHIVO:
+  - Por cada archivo que genera registros, se guarda un CSV en
+    PROCESADO/AAAA-MM-DD/AGENCIA/ con nombre:
+      <nombre_archivo_sin_extension>_PROCESADO.csv
+    Este CSV contiene el dataframe generado para ese archivo en particular.
+
+Logging con loguru:
+  - Se reemplaza logging por loguru, con salida a consola y a
+    CONSOLIDADO/AAAA-MM-DD/BRITIMP_log.txt.
 -------------------------------------------------------------------------------
 """
 
 from __future__ import annotations
 
-import os
 import re
 import sys
 import shutil
 import unicodedata
-import logging
 from pathlib import Path
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, Tuple
 
 import pandas as pd
+from loguru import logger as _logger
 
 try:
     from pypdf import PdfReader
@@ -83,6 +90,7 @@ FINAL_COLUMNS = {
         "FECHA_ARCHIVO",
         "MOTIVO_MOVIMIENTO",
         "AGENCIA",
+        "SALDO_ANTERIOR",
     ],
     "EC_EFECT_ATM": [
         "FECHA_RECIBO",
@@ -96,6 +104,8 @@ FINAL_COLUMNS = {
         "FECHA_ARCHIVO",
         "MOTIVO_MOVIMIENTO",
         "AGENCIA",
+        "SALDO_ANTERIOR_PYG",
+        "SALDO_ANTERIOR_USD",
     ],
     "INV_BILLETES_BCO": [
         "FECHA_INVENTARIO",
@@ -135,18 +145,14 @@ FINAL_COLUMNS = {
         "FECHA_ARCHIVO",
         "MOTIVO_MOVIMIENTO",
         "AGENCIA",
+        "SALDO_ANTERIOR_PYG",
+        "SALDO_ANTERIOR_USD",
     ],
 }
 
 
 def resolve_root() -> Path:
-    """
-    Determina el directorio raíz del proyecto.
-
-    - Si el .py está dentro de una carpeta llamada 'BRITIMP', esa será la raíz.
-    - Si existe una subcarpeta 'BRITIMP', se usa esa.
-    - En otro caso, se usa el cwd.
-    """
+    """Determina el directorio raíz del proyecto."""
     here = Path(__file__).resolve().parent if "__file__" in globals() else Path.cwd()
     if (here / "PENDIENTES").exists() or (here.name.upper() == "BRITIMP"):
         return here
@@ -157,10 +163,7 @@ def resolve_root() -> Path:
 
 ROOT = resolve_root()
 
-# NUEVA ESTRUCTURA:
-# - PENDIENTES = ROOT (ej: BRITIMP), con subcarpetas ASU/CDE/ENC/OVD
-# - PROCESADO = ROOT/PROCESADO
-# - CONSOLIDADO = ROOT/CONSOLIDADO
+# PENDIENTES = ROOT (ej: BRITIMP), con subcarpetas ASU/CDE/ENC/OVD
 PENDIENTES = ROOT
 PROCESADO = ROOT / "PROCESADO"
 CONSOLIDADO = ROOT / "CONSOLIDADO"
@@ -169,11 +172,7 @@ AGENCIES = ["ASU", "CDE", "ENC", "OVD"]
 
 
 def ensure_dirs() -> None:
-    """
-    Crea solo las carpetas PROCESADO y CONSOLIDADO si no existen.
-    Las carpetas de agencias bajo ROOT (ASU, CDE, ENC, OVD) se asume que
-    son gestionadas externamente y se validan aparte.
-    """
+    """Crea solo las carpetas PROCESADO y CONSOLIDADO si no existen."""
     for d in [PROCESADO, CONSOLIDADO]:
         d.mkdir(parents=True, exist_ok=True)
 
@@ -182,10 +181,10 @@ ensure_dirs()
 
 
 # -------------------------------------------------------------------
-# LOGGING
+# LOGGING (loguru)
 # -------------------------------------------------------------------
 
-_LOGGER: Optional[logging.Logger] = None
+_LOG_CONFIGURED = False
 
 
 def today_folder() -> Path:
@@ -196,38 +195,25 @@ def today_folder() -> Path:
     return outdir
 
 
-def setup_logger() -> logging.Logger:
-    """Configura el logger para que escriba en archivo y en consola."""
-    global _LOGGER
-    if _LOGGER:
-        return _LOGGER
+def setup_logger():
+    global _LOG_CONFIGURED
+    if _LOG_CONFIGURED:
+        return _logger
 
     log_dir = today_folder()
     log_path = log_dir / "BRITIMP_log.txt"
 
-    logger = logging.getLogger("BRITIMP")
-    logger.setLevel(logging.INFO)
-    logger.handlers = []
+    # Limpia sinks previos y configura consola + archivo
+    _logger.remove()
+    fmt = "{time:YYYY-MM-DD HH:mm:ss} - {level} - {message}"
+    _logger.add(sys.stdout, format=fmt, level="INFO")
+    _logger.add(str(log_path), format=fmt, level="INFO", encoding="utf-8")
 
-    fmt = logging.Formatter(
-        "%(asctime)s - %(levelname)s - %(message)s", datefmt="%Y-%m-%d %H:%M:%S"
-    )
+    _logger.info("========== INICIO DE EJECUCIÓN ==========")
+    _logger.info(f"Directorio Raíz: {ROOT}")
 
-    # Archivo
-    fh = logging.FileHandler(log_path, encoding="utf-8", mode="a")
-    fh.setFormatter(fmt)
-    logger.addHandler(fh)
-
-    # Consola
-    ch = logging.StreamHandler(sys.stdout)
-    ch.setFormatter(fmt)
-    logger.addHandler(ch)
-
-    logger.info("=" * 10 + " INICIO DE EJECUCIÓN " + "=" * 10)
-    logger.info(f"Directorio Raíz: {ROOT}")
-
-    _LOGGER = logger
-    return logger
+    _LOG_CONFIGURED = True
+    return _logger
 
 
 def log_info(msg: str) -> None:
@@ -239,22 +225,22 @@ def log_warn(msg: str) -> None:
 
 
 def log_error(msg: str, **kwargs) -> None:
-    """
-    Logger de error que admite kwargs (por ejemplo, exc_info=True).
-    Esto permite usar log_error(..., exc_info=True) sin romper.
-    """
-    setup_logger().error(msg, **kwargs)
+    log = setup_logger()
+    if kwargs.get("exc_info"):
+        log.exception(msg)
+    else:
+        log.error(msg)
 
 
 # -------------------------------------------------------------------
-# HELPERS (Funciones de Utilidad)
+# HELPERS
 # -------------------------------------------------------------------
 
 DATE_RE = re.compile(r"^\s*(\d{1,2}/\d{1,2}/\d{4})\s*$", re.IGNORECASE)
 
 
 def has_string_date(row_vals: List[Any]) -> bool:
-    """Verifica si alguna celda en la fila es una fecha en formato string dd/mm/yyyy."""
+    """Verifica si alguna celda en la fila es una fecha en formato dd/mm/yyyy o datetime."""
     for c in row_vals:
         if isinstance(c, str) and DATE_RE.match(c.strip()):
             return True
@@ -344,7 +330,9 @@ def unir_letras_separadas(texto: str) -> str:
 
 def remove_accents(s: str) -> str:
     """Quita acentos y diacríticos de un texto."""
-    return "".join(ch for ch in unicodedata.normalize("NFD", s) if not unicodedata.combining(ch))
+    return "".join(
+        ch for ch in unicodedata.normalize("NFD", s) if not unicodedata.combining(ch)
+    )
 
 
 def name_matches(fname: str, required_groups: List[List[str]]) -> bool:
@@ -388,7 +376,11 @@ def normalize_divisa_to_iso(value: Any) -> str:
     """Normaliza variantes de moneda a 'PYG' o 'USD'."""
     if not value:
         return ""
-    u = remove_accents(str(value).strip().upper()).replace("₲", "GS").replace("US$", "USD")
+    u = (
+        remove_accents(str(value).strip().upper())
+        .replace("₲", "GS")
+        .replace("US$", "USD")
+    )
     canon = re.sub(r"[^A-Z0-9]", "", u)
     if canon.startswith("GUAR") or canon in {"PYG", "GS", "GUARANI", "GUARANIES"}:
         return "PYG"
@@ -398,7 +390,7 @@ def normalize_divisa_to_iso(value: Any) -> str:
 
 
 # -------------------------------------------------------------------
-# LECTURA Y DETECCIÓN
+# LECTURA / DETECCIÓN DE CLIENTE / SIN MOVIMIENTOS
 # -------------------------------------------------------------------
 
 NEGATIVE_BANKS = [
@@ -465,10 +457,7 @@ def file_text_preview(path: Path, max_rows_excel: int = 40) -> str:
 
 
 def detect_cliente_itau(path: Path, tipo_documento: Optional[str]) -> bool:
-    """
-    Verifica si el documento es de Itaú. Primero busca explícitamente otros bancos
-    con el formato "CLIENTE: [BANCO]" para evitar falsos positivos.
-    """
+    """Detecta si el documento corresponde a Itaú."""
     txt = unir_letras_separadas(file_text_preview(path)).upper()
 
     # Descarte explícito de otros bancos
@@ -478,18 +467,20 @@ def detect_cliente_itau(path: Path, tipo_documento: Optional[str]) -> bool:
             log_info(f"[SKIP] {path.name} -> Otro banco detectado explícitamente: '{bank}'")
             return False
 
-    # Si no se descarta, se procede con la lógica de aceptación para Itaú
     fname_upper = remove_accents(path.name).upper()
     if "ITAU" in txt or "ITAU" in fname_upper:
         return True
 
-    # Para Estados de Cuenta (EC), si no se menciona "ITAU" explícitamente, se descarta por seguridad.
+    # Estados de cuenta: más estrictos
     if tipo_documento and "EC_" in tipo_documento:
-        if name_matches(path.name, [["EC"], ["ATM", "BCO", "BANCO", "BULTO"], ["EFECTIVO", "BILLETE"]]):
+        if name_matches(
+            path.name,
+            [["EC"], ["ATM", "BCO", "BANCO", "BULTO"], ["EFECTIVO", "BILLETE"]],
+        ):
             log_info(f"[SKIP] {path.name} -> Es Estado de Cuenta pero no menciona 'ITAU'.")
             return False
 
-    # Para Inventarios (INV), somos más permisivos. Si el nombre coincide con el patrón, se acepta.
+    # Inventarios: más permisivos
     if tipo_documento and "INV_" in tipo_documento:
         if name_matches(path.name, [["INV"], ["BILLETE"], ["ATM", "BCO", "BANCO", "DOLAR"]]):
             return True
@@ -499,7 +490,7 @@ def detect_cliente_itau(path: Path, tipo_documento: Optional[str]) -> bool:
 
 
 def detect_sin_movimientos(path: Path) -> bool:
-    """Detecta si el archivo contiene la frase 'SIN MOVIMIENTOS' con espacios flexibles."""
+    """Detecta si el archivo contiene la frase 'SIN MOVIMIENTOS'."""
     txt = unir_letras_separadas(file_text_preview(path)).upper()
     return bool(re.search(r"SIN\s+MOVIMIENTOS?", txt))
 
@@ -515,14 +506,15 @@ def parse_agencia_from_text(text: str) -> str:
 
 
 # -------------------------------------------------------------------
-# DISPATCHER (Selector de Tipo)
+# DISPATCHER (Tipo de documento)
 # -------------------------------------------------------------------
 
+
 def dispatch_tipo(fname: str, text_content: str = "") -> Optional[str]:
-    """Determina el tipo de documento basado en el nombre del archivo y su contenido."""
+    """Determina el tipo de documento basado en nombre y contenido."""
     up = remove_accents(fname).upper()
 
-    # Reglas prioritarias para PDF de inventario por nombre
+    # Reglas prioritarias para PDF de inventario
     if up.endswith(".PDF"):
         if name_matches(up, [["INV"], ["ATM"]]):
             return "INV_BILLETES_ATM"
@@ -543,7 +535,7 @@ def dispatch_tipo(fname: str, text_content: str = "") -> Optional[str]:
     if name_matches(up, [["INV"], ["BILLETE"], ["BCO", "BANCO", "DOLAR"]]):
         return "INV_BILLETES_BCO"
 
-    # Fallback para PDFs con nombre genérico, usando contenido
+    # Fallback para PDFs de inventario con nombre genérico
     if "INV" in up:
         up_text = text_content.upper()
         if "INVENTARIO DE BILLETES DE ATM" in up_text:
@@ -556,8 +548,9 @@ def dispatch_tipo(fname: str, text_content: str = "") -> Optional[str]:
 
 
 # -------------------------------------------------------------------
-# PARSERS (Extractores de Datos)
+# PARSERS
 # -------------------------------------------------------------------
+
 
 def parse_ec_bultos_atm_xlsx(path: Path, DEBUG: bool = False) -> pd.DataFrame:
     """Parser para 'Estado de Cuenta Bultos ATM' (.xls y .xlsx)."""
@@ -576,6 +569,20 @@ def parse_ec_bultos_atm_xlsx(path: Path, DEBUG: bool = False) -> pd.DataFrame:
             re.IGNORECASE,
         )
         fecha_archivo = m_fecha.group(1) if m_fecha else None
+
+        # --- SALDO ANTERIOR (PYG / USD) ---
+        saldo_ant_pyg: Optional[float] = None
+        saldo_ant_usd: Optional[float] = None
+        for _, row_sa in df_raw.iterrows():
+            row_vals = row_sa.tolist()
+            txt_sa = " ".join(map(str, filter(pd.notna, row_vals))).upper()
+            if "SALDO ANTERIOR" in txt_sa:
+                nums = [parse_numeric(c) for c in row_vals if parse_numeric(c) is not None]
+                # Esperado: [bultos_pyg, saldo_pyg, bultos_usd, saldo_usd]
+                if len(nums) >= 2:
+                    saldo_ant_pyg = nums[1]
+                if len(nums) >= 4:
+                    saldo_ant_usd = nums[3]
 
         section, motivo, started = None, None, False
         for _, row_series in df_raw.iterrows():
@@ -661,6 +668,8 @@ def parse_ec_bultos_atm_xlsx(path: Path, DEBUG: bool = False) -> pd.DataFrame:
                         "MOTIVO_MOVIMIENTO": (motivo or section),
                         "AGENCIA": agencia,
                         "ARCHIVO_ORIGEN": path.name,
+                        "SALDO_ANTERIOR_PYG": saldo_ant_pyg,
+                        "SALDO_ANTERIOR_USD": saldo_ant_usd,
                     }
                 )
 
@@ -695,6 +704,20 @@ def parse_ec_efect_bco_xlsx(path: Path, DEBUG: bool = False) -> pd.DataFrame:
         extra_cliente = (
             " (DOCUMENTA/ITAU)" if "CLIENTE: DOCUMENTA /ITAU" in full_text.upper() else ""
         )
+
+        # --- SALDO ANTERIOR (única columna) ---
+        saldo_anterior_val: Optional[float] = None
+        for _, row_sa in df_raw.iterrows():
+            row_vals = row_sa.tolist()
+            for idx, cell in enumerate(row_vals):
+                if isinstance(cell, str) and "SALDO ANTERIOR" in cell.upper():
+                    nums = [
+                        parse_numeric(c)
+                        for c in row_vals[idx + 1 :]
+                        if parse_numeric(c) is not None
+                    ]
+                    if nums:
+                        saldo_anterior_val = nums[0]
 
         registros: List[Dict[str, Any]] = []
         current_section: Optional[str] = None
@@ -782,9 +805,11 @@ def parse_ec_efect_bco_xlsx(path: Path, DEBUG: bool = False) -> pd.DataFrame:
                     "ING_EGR": "IN" if current_section == "INGRESOS" else "OUT",
                     "CLASIFICACION": "BCO",
                     "FECHA_ARCHIVO": fecha_archivo,
-                    "MOTIVO_MOVIMIENTO": (current_motivo or current_section) + extra_cliente,
+                    "MOTIVO_MOVIMIENTO": (current_motivo or current_section)
+                    + extra_cliente,
                     "AGENCIA": agencia,
                     "ARCHIVO_ORIGEN": path.name,
+                    "SALDO_ANTERIOR": saldo_anterior_val,
                 }
             )
 
@@ -1023,6 +1048,23 @@ def parse_ec_efect_atm_xlsx(path: Path, DEBUG: bool = False) -> pd.DataFrame:
         )
         fecha_archivo = m_fecha.group(1) if m_fecha else None
 
+        # --- SALDO ANTERIOR (USD / PYG) ---
+        saldo_ant_pyg: Optional[float] = None
+        saldo_ant_usd: Optional[float] = None
+        for _, row_sa in df_raw.iterrows():
+            row_vals = row_sa.tolist()
+            for idx, cell in enumerate(row_vals):
+                if isinstance(cell, str) and "SALDO ANTERIOR" in cell.upper():
+                    nums = [
+                        parse_numeric(c)
+                        for c in row_vals[idx + 1 :]
+                        if parse_numeric(c) is not None
+                    ]
+                    if len(nums) >= 1:
+                        saldo_ant_usd = nums[0]
+                    if len(nums) >= 2:
+                        saldo_ant_pyg = nums[1]
+
         section, motivo, started = None, None, False
         for _, row_series in df_raw.iterrows():
             row = row_series.tolist()
@@ -1035,6 +1077,9 @@ def parse_ec_efect_atm_xlsx(path: Path, DEBUG: bool = False) -> pd.DataFrame:
                 continue
             if txt_upper == "EGRESOS":
                 section, motivo, started = "EGRESOS", None, True
+                continue
+            if "SALDO ANTERIOR" in txt_upper:
+                # fila de saldo, ya tomada
                 continue
             if not started:
                 continue
@@ -1088,7 +1133,7 @@ def parse_ec_efect_atm_xlsx(path: Path, DEBUG: bool = False) -> pd.DataFrame:
                 if b is not None and 0 <= b < 1000 and float(b).is_integer():
                     bultos, idx = int(b), idx + 1
 
-            # Montos (cola numérica)
+            # Montos
             nums_tail = [parse_numeric(c) for c in row[idx:] if pd.notna(c)]
             nums_tail = [n for n in nums_tail if n is not None]
 
@@ -1113,6 +1158,8 @@ def parse_ec_efect_atm_xlsx(path: Path, DEBUG: bool = False) -> pd.DataFrame:
                         "MOTIVO_MOVIMIENTO": (motivo or section),
                         "AGENCIA": agencia,
                         "ARCHIVO_ORIGEN": path.name,
+                        "SALDO_ANTERIOR_PYG": saldo_ant_pyg,
+                        "SALDO_ANTERIOR_USD": saldo_ant_usd,
                     }
                 )
 
@@ -1141,6 +1188,7 @@ OUTPUT_FILES = {
 # POST-PROCESAMIENTO
 # -------------------------------------------------------------------
 
+
 def post_process_dataframes(data_dict: Dict[str, pd.DataFrame]) -> Dict[str, pd.DataFrame]:
     """Aplica limpiezas finales a los dataframes: renombra, formatea y elimina columnas."""
     processed_dict: Dict[str, pd.DataFrame] = {}
@@ -1159,7 +1207,14 @@ def post_process_dataframes(data_dict: Dict[str, pd.DataFrame]) -> Dict[str, pd.
             if "FECHA_OPERACION" in df_copy.columns:
                 df_copy = df_copy.rename(columns={"FECHA_OPERACION": "FECHA_RECIBO"})
 
-            for col in ["MONTO", "IMPORTE", "BULTOS"]:
+            for col in [
+                "MONTO",
+                "IMPORTE",
+                "BULTOS",
+                "SALDO_ANTERIOR",
+                "SALDO_ANTERIOR_PYG",
+                "SALDO_ANTERIOR_USD",
+            ]:
                 if col in df_copy.columns:
                     df_copy[col] = (
                         pd.to_numeric(df_copy[col], errors="coerce").astype("Int64")
@@ -1219,20 +1274,13 @@ def write_all_consolidated(all_data: Dict[str, pd.DataFrame]) -> None:
 # PROCESO DE UN ARCHIVO
 # -------------------------------------------------------------------
 
+
 def process_file(
     path: Path,
     parent_agency_hint: Optional[str] = None,
     DEBUG: bool = False,
 ) -> Tuple[pd.DataFrame, Optional[str], str, bool]:
-    """
-    Procesa un único archivo, desde la detección hasta el parsing.
-
-    Retorna:
-      - DataFrame con registros.
-      - tipo lógico (clave de OUTPUT_FILES).
-      - agencia detectada (o hint).
-      - bool procesado_ok (True si era de Itaú y el parser no explotó).
-    """
+    """Procesa un único archivo, desde la detección hasta el parsing."""
     log_info(
         f"[ANALIZANDO] '{path.name}' en carpeta '{parent_agency_hint or 'RAIZ'}'"
     )
@@ -1242,7 +1290,6 @@ def process_file(
 
     # Verificación de cliente
     if not detect_cliente_itau(path, tipo):
-        # No es Itaú ⇒ no se procesa, marcamos como fallo lógico
         return pd.DataFrame(), tipo, (parent_agency_hint or ""), False
 
     # SIN MOVIMIENTOS
@@ -1309,7 +1356,6 @@ def process_file(
 
     log_info(f"-> Parser ejecutado: {parser_used}. Registros obtenidos: {len(df)}")
 
-    # Mensaje explícito cuando no se generaron registros (y no era 'SIN MOVIMIENTOS')
     if df.empty:
         log_info(
             f"[SIN REGISTROS] '{path.name}' no generó registros para el tipo {tipo}."
@@ -1319,42 +1365,54 @@ def process_file(
 
 
 # -------------------------------------------------------------------
-# MOVIMIENTO DE ARCHIVOS A PROCESADO
+# MOVIMIENTO DE ARCHIVOS / RAW POR ARCHIVO
 # -------------------------------------------------------------------
 
-def move_original(path: Path, agencia: str, procesado_ok: bool) -> None:
-    """
-    Mueve el archivo original a la carpeta:
-        PROCESADO/AAAA-MM-DD/AGENCIA/
 
-    - Se deja una copia con el nombre original.
-    - El archivo "procesado" se renombra con sufijo _OK o _ERROR + timestamp.
-    """
+def get_procesado_dir(agencia: str) -> Path:
+    """Devuelve la carpeta PROCESADO/AAAA-MM-DD/AGENCIA (creándola si no existe)."""
     today_str = datetime.now().strftime("%Y-%m-%d")
     agencia_dir_name = (agencia or "").upper()
     if agencia_dir_name not in AGENCIES:
         agencia_dir_name = "SIN_AGENCIA"
-
     dest_dir = PROCESADO / today_str / agencia_dir_name
     dest_dir.mkdir(parents=True, exist_ok=True)
+    return dest_dir
 
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    status = "OK" if procesado_ok else "ERROR"
-    processed_name = f"{path.stem}_{status}_{timestamp}{path.suffix}"
 
-    original_dest = dest_dir / path.name
-    processed_dest = dest_dir / processed_name
-
+def write_per_file_raw(df: pd.DataFrame, path: Path, agencia: str) -> None:
+    """Guarda el dataframe de un archivo individual en un CSV _PROCESADO."""
+    if df.empty:
+        return
+    dest_dir = get_procesado_dir(agencia)
+    raw_name = f"{path.stem}_PROCESADO.csv"
+    raw_path = dest_dir / raw_name
     try:
-        shutil.copy2(str(path), str(original_dest))
-        shutil.move(str(path), str(processed_dest))
+        df.to_csv(raw_path, index=False, encoding="utf-8-sig", sep=";")
         log_info(
-            f"-> [MOVIDO] '{path.name}' a '{processed_dest}' "
-            f"(copia en '{original_dest.name}')"
+            f"-> [RAW ESCRITO] {len(df)} registros guardados en '{raw_path.name}'"
         )
     except Exception as e:
         log_error(
-            f"-> ¡ERROR! No se pudo mover/copiar el archivo '{path.name}'. Detalles: {e}"
+            f"-> [ERROR RAW] No se pudo guardar '{raw_path.name}'. Detalles: {e}"
+        )
+
+
+def move_original(path: Path, agencia: str, procesado_ok: bool) -> None:
+    """Mueve el archivo original a PROCESADO/AAAA-MM-DD/AGENCIA/ con su nombre original."""
+    dest_dir = get_procesado_dir(agencia)
+    dest_path = dest_dir / path.name
+
+    try:
+        if dest_path.exists():
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            dest_path = dest_dir / f"{path.stem}_{timestamp}{path.suffix}"
+        shutil.move(str(path), str(dest_path))
+        status = "OK" if procesado_ok else "ERROR"
+        log_info(f"-> [MOVIDO {status}] '{path.name}' a '{dest_path}'")
+    except Exception as e:
+        log_error(
+            f"-> ¡ERROR! No se pudo mover el archivo '{path.name}'. Detalles: {e}"
         )
 
 
@@ -1362,13 +1420,9 @@ def move_original(path: Path, agencia: str, procesado_ok: bool) -> None:
 # VALIDACIÓN Y SCAN DE PENDIENTES
 # -------------------------------------------------------------------
 
-def validate_pending_agencies() -> bool:
-    """
-    Verifica que cada carpeta de agencia bajo PENDIENTES (ROOT) exista
-    y tenga al menos un archivo pendiente (.xlsx/.xls/.pdf).
 
-    Si alguna está ausente o vacía, se loguea error y se aborta el proceso.
-    """
+def validate_pending_agencies() -> bool:
+    """Verifica que cada carpeta de agencia bajo PENDIENTES exista y tenga archivos."""
     problemas: List[str] = []
 
     for agencia in AGENCIES:
@@ -1420,9 +1474,10 @@ def collect_pending_files() -> List[Tuple[Path, Optional[str]]]:
 # MAIN
 # -------------------------------------------------------------------
 
+
 def run(DEBUG: bool = False) -> Dict[str, int]:
     """Función principal que orquesta todo el proceso."""
-    setup_logger()  # inicializa logger y crea CONSOLIDADO/AAAA-MM-DD
+    setup_logger()
 
     # Validar que todas las agencias tengan archivos pendientes
     if not validate_pending_agencies():
@@ -1431,7 +1486,7 @@ def run(DEBUG: bool = False) -> Dict[str, int]:
             "[ABORTADO] Validación de carpetas de pendientes falló; "
             "no se procesó ningún archivo."
         )
-        log_info("=" * 10 + " FIN DE EJECUCIÓN " + "=" * 10 + "\n")
+        log_info("========== FIN DE EJECUCIÓN ==========" + "\n")
         return stats
 
     pendientes = collect_pending_files()
@@ -1444,16 +1499,19 @@ def run(DEBUG: bool = False) -> Dict[str, int]:
             path, parent_agency_hint=agencia_hint, DEBUG=DEBUG
         )
 
-        # Procesado exitoso a efectos de mover
         procesado_exitoso = procesado_ok_flag and (
             not df.empty or (tipo is not None and detect_sin_movimientos(path))
         )
 
-        # Solo acumulamos si hubo datos y el archivo era válido de Itaú
+        # Guardar RAW por archivo si hay datos
+        if procesado_ok_flag and not df.empty:
+            write_per_file_raw(df, path, agencia_final or agencia_hint or "")
+
+        # Acumular para consolidado si aplica
         if procesado_ok_flag and tipo and tipo in all_dataframes and not df.empty:
             all_dataframes[tipo].append(df)
 
-        # Mover a PROCESADO con sufijo OK/ERROR
+        # Mover a PROCESADO con nombre original
         move_original(path, agencia_final or agencia_hint or "", procesado_exitoso)
         log_info("-" * 50)
 
@@ -1476,7 +1534,7 @@ def run(DEBUG: bool = False) -> Dict[str, int]:
         resumen_partes.append(f"{k}: {v}")
     resumen_texto = ", ".join(resumen_partes)
     log_info(f"[RESUMEN FINAL] Registros añadidos: {resumen_texto}")
-    log_info("=" * 10 + " FIN DE EJECUCIÓN " + "=" * 10 + "\n")
+    log_info("========== FIN DE EJECUCIÓN ==========" + "\n")
     return stats
 
 
