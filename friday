@@ -1,0 +1,1016 @@
+# -*- coding: utf-8 -*-
+"""
+BRITIMP - Consolidado
+"""
+from __future__ import annotations
+import os
+import re
+import sys
+import shutil
+import unicodedata
+#import logging
+from loguru import logger
+from pathlib import Path
+from datetime import datetime, timedelta
+from typing import Any, Dict, List, Optional, Tuple
+
+import pandas as pd
+
+try:
+    from pypdf import PdfReader
+except ImportError:
+    PdfReader = None
+    print("ADVERTENCIA: 'pypdf' no está instalado. El parseo de PDF no funcionará.")
+
+
+# ------------------------------ CONFIGURACIÓN DE RUTAS Y COLUMNAS FINALES ------------------------------
+
+AGENCIA_ALIASES = {
+    'ASU': ['ASUNCION', 'ASU'],
+    'CDE': ['CIUDAD DEL ESTE', 'CDE'],
+    'ENC': ['ENCARNACION', 'ENC'],
+    'CON': ['CONCEPCION', 'CON']
+}
+
+
+FINAL_COLUMNS = {
+    "EC_EFECT_BCO": [
+        "FECHA_RECIBO",
+        "SUCURSAL",
+        "RECIBO",
+        "BULTOS",
+        "IMPORTE",
+        "MONEDA",
+        "ING_EGR",
+        "CLASIFICACION",
+        "FECHA_ARCHIVO",
+        "MOTIVO_MOVIMIENTO",
+        "AGENCIA",
+    ],
+    "EC_EFECT_ATM": [
+        "FECHA_RECIBO",
+        "SUCURSAL",
+        "RECIBO",
+        "BULTOS",
+        "MONTO",
+        "MONEDA",
+        "ING_EGR",
+        "CLASIFICACION",
+        "FECHA_ARCHIVO",
+        "MOTIVO_MOVIMIENTO",
+        "AGENCIA",
+    ],
+    "INV_BILLETES_BCO": [
+        "FECHA_INVENTARIO",
+        "DIVISA",
+        "AGENCIA",
+        "AGRUPACION_EFECTIVO",
+        "TIPO_VALOR",
+        "DENOMINACION",
+        "CALIDAD_DEPOSITO",
+        "CALIDAD_CD",
+        "CALIDAD_CANJE",
+        "MONEDA",
+        "IMPORTE_TOTAL",
+    ],
+    "INV_BILLETES_ATM": [
+        "FECHA_INVENTARIO",
+        "DIVISA",
+        "AGENCIA",
+        "AGRUPACION_EFECTIVO",
+        "TIPO_VALOR",
+        "DENOMINACION",
+        "CALIDAD_DEPOSITO",
+        "CALIDAD_CD",
+        "CALIDAD_CANJE",
+        "MONEDA",
+        "IMPORTE_TOTAL",
+    ],
+    "EC_BULTO_ATM": [
+        "FECHA_RECIBO",
+        "SUCURSAL",
+        "RECIBO",
+        "BULTOS",
+        "MONTO",
+        "MONEDA",
+        "ING_EGR",
+        "CLASIFICACION",
+        "FECHA_ARCHIVO",
+        "MOTIVO_MOVIMIENTO",
+        "AGENCIA",
+    ],
+}
+
+
+def resolve_root() -> Path:
+    """Determina el directorio raíz del proyecto."""
+    here = Path(__file__).resolve().parent if "__file__" in globals() else Path.cwd()
+    if (here / "PENDIENTES").exists() or (here.name.upper() == "BRITIMP"):
+        return here
+    if (here / "BRITIMP").exists():
+        return here / "BRITIMP"
+    return here
+
+
+# En Jupyter, podés dejar esta ruta local;
+# en producción la cambiás por la ruta del share de red.
+ROOT = Path("./DATA/BRITIMP")  # En producción, reemplazar por ruta de red BRITIMP
+# En la nueva estructura, la carpeta raíz BRITIMP es la de pendientes:
+# dentro estarán las carpetas de agencias (ASU, CDE, ENC, OVD)
+PENDIENTES = ROOT
+
+# Las carpetas de salida se mantienen como subcarpetas de BRITIMP
+PROCESADO = ROOT / "PROCESADO"
+CONSOLIDADO = ROOT / "CONSOLIDADO"
+
+# Lista de agencias actualizada
+AGENCIES = ["ASU", "CDE", "ENC", "OVD"]
+
+
+def ensure_output_dirs() -> None:
+    """Crea las carpetas PROCESADO y CONSOLIDADO si no existen."""
+    PROCESADO.mkdir(parents=True, exist_ok=True)
+    CONSOLIDADO.mkdir(parents=True, exist_ok=True)
+#ensure_dirs()
+
+# ------------------------------ LOGGING ------------------------------
+
+# Si quisieras reactivar logging estándar:
+# import logging
+# _LOGGER: Optional[logging.Logger] = None
+
+def today_folder() -> Path:
+    """Crea y devuelve la ruta a la carpeta de consolidados del día de hoy."""
+    today = datetime.now().strftime("%Y-%m-%d")
+    outdir = CONSOLIDADO / today
+    outdir.mkdir(parents=True, exist_ok=True)
+    return outdir
+
+#def setup_logger() -> logging.Logger:
+#    """Configura el logger para que escriba en archivo y en consola."""
+#    global _LOGGER
+#    if _LOGGER:
+#        return _LOGGER
+#
+#    log_dir = Path("./logs")
+#    log_dir.mkdir(exist_ok=True)
+#    log_path = log_dir / f"britimp_consolidado_{datetime.now().strftime('%Y%m%d')}.log"
+#
+#    logger_ = logging.getLogger("britimp_consolidado")
+#    logger_.setLevel(logging.INFO)
+#
+#    fh = logging.FileHandler(log_path, encoding='utf-8', mode='a')
+#    ch = logging.StreamHandler(sys.stdout)
+#
+#    formatter = logging.Formatter(
+#        "%(asctime)s [%(levelname)s] %(message)s",
+#        datefmt="%Y-%m-%d %H:%M:%S"
+#    )
+#    fh.setFormatter(formatter)
+#    ch.setFormatter(formatter)
+#
+#    logger_.addHandler(fh)
+#    logger_.addHandler(ch)
+#
+#    _LOGGER = logger_
+#    return logger_
+
+
+# ------------------------------ HELPERS GENERALES ------------------------------
+
+def normalize_text(text: str) -> str:
+    """Normaliza texto quitando acentos y espacios extra."""
+    if not isinstance(text, str):
+        text = str(text)
+    text = " ".join(text.split())
+    text = unicodedata.normalize("NFKD", text)
+    text = "".join(c for c in text if not unicodedata.combining(c))
+    return text.upper()
+
+
+def parse_numeric(value: Any) -> Optional[float]:
+    """Intenta parsear un valor numérico desde texto."""
+    if pd.isna(value):
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    s = str(value).strip()
+    if s in ("", "-", "–"):
+        return None
+    s = s.replace(".", "").replace(",", ".")
+    try:
+        return float(s)
+    except ValueError:
+        return None
+
+
+def parse_date_from_text(text: str) -> Optional[str]:
+    """Busca una fecha en formato dd/mm/yyyy en el texto."""
+    match = re.search(r"(\d{2}/\d{2}/\d{4})", text)
+    if match:
+        return match.group(1)
+    return None
+
+
+def parse_agencia_from_text(text: str) -> Optional[str]:
+    """Intenta identificar la agencia (ASU, CDE, ENC, CON) desde el texto."""
+    text_norm = normalize_text(text)
+    for agencia, aliases in AGENCIA_ALIASES.items():
+        for alias in aliases:
+            if alias in text_norm:
+                return agencia
+    return None
+
+
+def guess_tipo_from_filename(filename: str) -> Optional[str]:
+    """Intenta inferir el tipo de archivo a partir del nombre."""
+    fname = filename.upper()
+    if "BULTO" in fname or "BULTOS" in fname:
+        return "EC_BULTO_ATM"
+    if "INVENTARIO" in fname:
+        if "ATM" in fname:
+            return "INV_BILLETES_ATM"
+        return "INV_BILLETES_BCO"
+    if "EFECT" in fname or "ESTADO" in fname or "EC_" in fname:
+        if "ATM" in fname:
+            return "EC_EFECT_ATM"
+        return "EC_EFECT_BCO"
+    return None
+
+
+def is_documenta_itau(text: str) -> bool:
+    """Devuelve True si el texto hace referencia a DOCUMENTA/ITAU."""
+    return "DOCUMENTA" in normalize_text(text) and "ITAU" in normalize_text(text)
+
+
+# ------------------------------ PARSERS PDF ------------------------------
+
+def extract_text_from_pdf(path: Path) -> str:
+    """Extrae todo el texto de un PDF."""
+    if PdfReader is None:
+        raise RuntimeError("PdfReader no disponible. Instala 'pypdf'.")
+    reader = PdfReader(str(path))
+    texts = []
+    for page in reader.pages:
+        try:
+            texts.append(page.extract_text() or "")
+        except Exception:
+            texts.append("")
+    return "\n".join(texts)
+
+
+def parse_ec_banco_pdf(path: Path, DEBUG: bool = False) -> pd.DataFrame:
+    """
+    Parser para PDFs de Estado de Cuenta Banco.
+    Este parser puede necesitar ajustes según el layout real.
+    """
+    try:
+        text = extract_text_from_pdf(path)
+    except Exception as e:
+        logger.error(f"[PDF ERROR] No se pudo leer '{path.name}': {e}")
+        return pd.DataFrame()
+
+    text_norm = normalize_text(text)
+    if not is_documenta_itau(text_norm):
+        logger.info(f"[OMITIDO] '{path.name}' no parece ser de DOCUMENTA/ITAU.")
+        return pd.DataFrame()
+
+    fecha_archivo = parse_date_from_text(text)
+    agencia = parse_agencia_from_text(text)
+
+    df = pd.DataFrame(
+        columns=[
+            "FECHA_RECIBO",
+            "SUCURSAL",
+            "RECIBO",
+            "BULTOS",
+            "IMPORTE",
+            "MONEDA",
+            "ING_EGR",
+            "CLASIFICACION",
+            "FECHA_ARCHIVO",
+            "MOTIVO_MOVIMIENTO",
+            "AGENCIA",
+            "ARCHIVO_ORIGEN",
+        ]
+    )
+
+    # TODO: aquí deberías implementar el parseo real de las líneas del PDF.
+    # De momento, devolvemos un DF vacío con las columnas correctas.
+    if DEBUG:
+        logger.debug(f"[PDF PARSE] Parser EC BANCO PDF aún no implementado para '{path.name}'")
+
+    return df
+
+
+# ------------------------------ PARSERS EXCEL: EC EFECTIVO BANCO ------------------------------
+
+def parse_ec_efect_bco_xlsx(path: Path, DEBUG: bool = False) -> pd.DataFrame:
+    """Parser específico para 'Estado de Cuenta Efectivo Banco' (.xls y .xlsx)."""
+    try:
+        xl = pd.ExcelFile(path)
+    except Exception as e:
+        logger.error(f"[XLSX ERROR] No se pudo leer '{path.name}': {e}")
+        return pd.DataFrame()
+
+    all_dfs: List[pd.DataFrame] = []
+
+    for sheet_name in xl.sheet_names:
+        try:
+            df_raw = pd.read_excel(xl, sheet_name=sheet_name, header=None)
+        except Exception as e:
+            logger.error(f"[XLSX ERROR] No se pudo leer hoja '{sheet_name}' de '{path.name}': {e}")
+            continue
+
+        full_text = " ".join(df_raw.astype(str).agg(" ".join, axis=1))
+        text_norm = normalize_text(full_text)
+
+        if not is_documenta_itau(text_norm):
+            logger.info(
+                f"[OMITIDO] Hoja '{sheet_name}' de '{path.name}' no parece ser DOCUMENTA/ITAU."
+            )
+            continue
+
+        moneda = "USD" if "MONEDA: DOLAR" in text_norm else "PYG"
+        agencia = parse_agencia_from_text(full_text)
+
+        m_fecha = re.search(r"BANCO\s+DEL:\s*(\d{2}/\d{2}/\d{4})", text_norm)
+        fecha_archivo = m_fecha.group(1) if m_fecha else None
+
+        extra_cliente = " (DOCUMENTA/ITAU)" if "CLIENTE: DOCUMENTA /ITAU" in text_norm else ""
+
+        registros: List[Dict[str, Any]] = []
+        current_section: Optional[str] = None
+        current_motivo: Optional[str] = None
+        in_table = False
+
+        for _, row in df_raw.iterrows():
+            row_list = [str(x) if not pd.isna(x) else "" for x in row]
+            joined = " ".join(row_list).strip().upper()
+
+            if not joined:
+                continue
+
+            if "INGRESOS" in joined and "EGRESOS" not in joined:
+                current_section = "INGRESOS"
+                current_motivo = None
+                in_table = False
+                continue
+            if "EGRESOS" in joined:
+                current_section = "EGRESOS"
+                current_motivo = None
+                in_table = False
+                continue
+
+            if "DETALLE" in joined and ("INGRESOS" in joined or "EGRESOS" in joined):
+                in_table = True
+                continue
+
+            if "SALDO ANTERIOR" in joined or "SALDO FINAL" in joined or "TOTAL" in joined:
+                in_table = False
+                continue
+
+            if current_section == "INGRESOS":
+                if not joined.startswith("INGRESOS"):
+                    current_motivo = joined
+            elif current_section == "EGRESOS":
+                if not joined.startswith("EGRESOS"):
+                    current_motivo = joined
+
+            if not in_table:
+                continue
+
+            cols = [c.strip() for c in row_list if c.strip() != ""]
+            if len(cols) < 4:
+                continue
+
+            fecha = cols[0]
+            sucursal = cols[1]
+            recibo = cols[2]
+            bultos = parse_numeric(cols[3])
+
+            importe_candidates = [parse_numeric(c) for c in cols[3:]]
+            importe_candidates = [x for x in importe_candidates if x is not None]
+
+            if not importe_candidates or current_section is None:
+                continue
+
+            try:
+                parsed_fecha = datetime.strptime(fecha, "%d/%m/%Y").date()
+            except Exception:
+                parse_df = pd.to_datetime(fecha, errors="coerce", dayfirst=True)
+                if pd.isna(parse_df):
+                    continue
+                parsed_fecha = parse_df.date()
+
+            registros.append(
+                {
+                    "FECHA_RECIBO": parsed_fecha,
+                    "SUCURSAL": sucursal,
+                    "RECIBO": recibo,
+                    "BULTOS": int(bultos) if bultos is not None else None,
+                    "IMPORTE": max(importe_candidates),
+                    "MONEDA": moneda,
+                    "ING_EGR": "IN" if current_section == "INGRESOS" else "OUT",
+                    "CLASIFICACION": "BCO",
+                    "FECHA_ARCHIVO": fecha_archivo,
+                    "MOTIVO_MOVIMIENTO": (current_motivo or current_section) + extra_cliente,
+                    "AGENCIA": agencia,
+                    "ARCHIVO_ORIGEN": path.name,
+                }
+            )
+
+        if registros:
+            all_dfs.append(pd.DataFrame(registros))
+
+    if not all_dfs:
+        return pd.DataFrame()
+
+    return pd.concat(all_dfs, ignore_index=True)
+
+
+# ------------------------------ PARSERS EXCEL: EC EFECTIVO ATM ------------------------------
+
+def parse_ec_efect_atm_xlsx(path: Path, DEBUG: bool = False) -> pd.DataFrame:
+    """Parser para Estado de Cuenta Efectivo ATM."""
+    try:
+        xl = pd.ExcelFile(path)
+    except Exception as e:
+        logger.error(f"[XLSX ERROR] No se pudo leer '{path.name}': {e}")
+        return pd.DataFrame()
+
+    all_dfs: List[pd.DataFrame] = []
+
+    for sheet_name in xl.sheet_names:
+        try:
+            df_raw = pd.read_excel(xl, sheet_name=sheet_name, header=None)
+        except Exception as e:
+            logger.error(f"[XLSX ERROR] No se pudo leer hoja '{sheet_name}' de '{path.name}': {e}")
+            continue
+
+        full_text = " ".join(df_raw.astype(str).agg(" ".join, axis=1))
+        text_norm = normalize_text(full_text)
+
+        if not is_documenta_itau(text_norm):
+            logger.info(
+                f"[OMITIDO] Hoja '{sheet_name}' de '{path.name}' no parece ser DOCUMENTA/ITAU."
+            )
+            continue
+
+        agencia = parse_agencia_from_text(full_text)
+        m_fecha = re.search(r"ESTADO DE CUENTA\s*DEL:\s*(\d{2}/\d{2}/\d{4})", text_norm)
+        fecha_archivo = m_fecha.group(1) if m_fecha else None
+
+        registros: List[Dict[str, Any]] = []
+        in_table = False
+        current_section: Optional[str] = None
+
+        for _, row in df_raw.iterrows():
+            row_list = [str(x) if not pd.isna(x) else "" for x in row]
+            joined = " ".join(row_list).strip().upper()
+            if not joined:
+                continue
+
+            if "INGRESOS" in joined and "EGRESOS" not in joined:
+                current_section = "INGRESOS"
+                continue
+            if "EGRESOS" in joined:
+                current_section = "EGRESOS"
+                continue
+            if "FECHA" in joined and "SUCURSAL" in joined and "RECIBO" in joined:
+                in_table = True
+                continue
+            if "SALDO ANTERIOR" in joined or "SALDO FINAL" in joined:
+                in_table = False
+                continue
+            if not in_table or current_section is None:
+                continue
+
+            cols = [c.strip() for c in row_list if c.strip() != ""]
+            if len(cols) < 5:
+                continue
+
+            fecha = cols[0]
+            sucursal = cols[1]
+            recibo = cols[2]
+            bultos = parse_numeric(cols[3])
+            monto = parse_numeric(cols[4])
+
+            if monto is None:
+                continue
+
+            try:
+                parsed_fecha = datetime.strptime(fecha, "%d/%m/%Y").date()
+            except Exception:
+                parse_df = pd.to_datetime(fecha, errors="coerce", dayfirst=True)
+                if pd.isna(parse_df):
+                    continue
+                parsed_fecha = parse_df.date()
+
+            registros.append(
+                {
+                    "FECHA_RECIBO": parsed_fecha,
+                    "SUCURSAL": sucursal,
+                    "RECIBO": recibo,
+                    "BULTOS": int(bultos) if bultos is not None else None,
+                    "MONTO": float(monto),
+                    "MONEDA": "PYG",
+                    "ING_EGR": "IN" if current_section == "INGRESOS" else "OUT",
+                    "CLASIFICACION": "ATM",
+                    "FECHA_ARCHIVO": fecha_archivo,
+                    "MOTIVO_MOVIMIENTO": current_section,
+                    "AGENCIA": agencia,
+                    "ARCHIVO_ORIGEN": path.name,
+                }
+            )
+
+        if registros:
+            all_dfs.append(pd.DataFrame(registros))
+
+    if not all_dfs:
+        return pd.DataFrame()
+    return pd.concat(all_dfs, ignore_index=True)
+
+
+# ------------------------------ PARSERS EXCEL: INVENTARIO BILLETES ------------------------------
+
+def parse_inventario_billetes_xlsx(path: Path, tipo: str, DEBUG: bool = False) -> pd.DataFrame:
+    """Parser genérico para inventario de billetes (banco / atm)."""
+    try:
+        xl = pd.ExcelFile(path)
+    except Exception as e:
+        logger.error(f"[XLSX ERROR] No se pudo leer '{path.name}': {e}")
+        return pd.DataFrame()
+
+    all_dfs: List[pd.DataFrame] = []
+
+    for sheet_name in xl.sheet_names:
+        try:
+            df_raw = pd.read_excel(xl, sheet_name=sheet_name)
+        except Exception as e:
+            logger.error(f"[XLSX ERROR] No se pudo leer hoja '{sheet_name}' de '{path.name}': {e}")
+            continue
+
+        if df_raw.empty:
+            continue
+
+        df_raw.columns = [normalize_text(str(c)) for c in df_raw.columns]
+
+        col_fecha = None
+        for candidate in ["FECHA_INVENTARIO", "FECHA", "FECHA_INV"]:
+            if candidate in df_raw.columns:
+                col_fecha = candidate
+                break
+
+        if not col_fecha:
+            logger.warning(f"[INVENTARIO] No se encontró columna de fecha en '{path.name}'.")
+            continue
+
+        df = df_raw.copy()
+
+        df["FECHA_INVENTARIO"] = pd.to_datetime(
+            df[col_fecha], errors="coerce", dayfirst=True
+        ).dt.date
+
+        mapping = {
+            "DIVISA": ["DIVISA", "MONEDA"],
+            "AGRUPACION_EFECTIVO": ["AGRUPACION_EFECTIVO", "AGRUPACION"],
+            "TIPO_VALOR": ["TIPO_VALOR", "TIPO"],
+            "DENOMINACION": ["DENOMINACION", "DENOM"],
+            "CALIDAD_DEPOSITO": ["CALIDAD_DEPOSITO", "CJE_DEP"],
+            "CALIDAD_CD": ["CALIDAD_CD"],
+            "CALIDAD_CANJE": ["CALIDAD_CANJE", "CJE_CNJ"],
+            "MONEDA": ["MONEDA", "DIVISA"],
+            "IMPORTE_TOTAL": ["IMPORTE_TOTAL", "IMPORTE"],
+            "AGENCIA": ["AGENCIA"],
+        }
+
+        out = pd.DataFrame()
+        out["FECHA_INVENTARIO"] = df["FECHA_INVENTARIO"]
+
+        for out_col, candidates in mapping.items():
+            for c in candidates:
+                if c in df.columns:
+                    out[out_col] = df[c]
+                    break
+            if out_col not in out.columns:
+                out[out_col] = None
+
+        out["ARCHIVO_ORIGEN"] = path.name
+        out["TIPO"] = tipo
+
+        all_dfs.append(out)
+
+    if not all_dfs:
+        return pd.DataFrame()
+
+    return pd.concat(all_dfs, ignore_index=True)
+
+
+# ------------------------------ PARSER EXCEL: EC BULTOS ATM ------------------------------
+
+def parse_ec_bultos_atm_xlsx(path: Path, DEBUG: bool = False) -> pd.DataFrame:
+    """Parser específico para Estado de Cuenta de Bultos ATM."""
+    try:
+        xl = pd.ExcelFile(path)
+    except Exception as e:
+        logger.error(f"[XLSX ERROR] No se pudo leer '{path.name}': {e}")
+        return pd.DataFrame()
+
+    registros: List[Dict[str, Any]] = []
+
+    for sheet_name in xl.sheet_names:
+        try:
+            df_raw = pd.read_excel(xl, sheet_name=sheet_name, header=None)
+        except Exception as e:
+            logger.error(f"[XLSX ERROR] No se pudo leer hoja '{sheet_name}' de '{path.name}': {e}")
+            continue
+
+        full_text = "\n".join(df_raw.astype(str).agg(" ".join, axis=1))
+        text_norm = normalize_text(full_text)
+
+        if not is_documenta_itau(text_norm):
+            logger.info(
+                f"[OMITIDO] Hoja '{sheet_name}' de '{path.name}' no parece ser DOCUMENTA/ITAU."
+            )
+            continue
+
+        agencia = parse_agencia_from_text(full_text)
+        m_fecha = re.search(
+            r"ESTADO\s+DE\s+CUENTA\s+DE\s+BULTOS\s+DEL:\s*(\d{2}/\d{2}/\d{4})", text_norm
+        )
+        fecha_archivo = m_fecha.group(1) if m_fecha else None
+
+        in_table = False
+        section: Optional[str] = None
+
+        for _, row in df_raw.iterrows():
+            row_list = [str(x) if not pd.isna(x) else "" for x in row]
+            joined = " ".join(row_list).strip().upper()
+            if not joined:
+                continue
+
+            if "INGRESOS" in joined and "EGRESOS" not in joined:
+                section = "INGRESOS"
+                continue
+            if "EGRESOS" in joined:
+                section = "EGRESOS"
+                continue
+            if "DETALLE" in joined and "INGRESOS" in joined:
+                in_table = True
+                continue
+            if "INFORME DE PROCESOS" in joined:
+                break
+
+            if not in_table or section is None:
+                continue
+
+            cols = [c.strip() for c in row_list if c.strip() != ""]
+            if len(cols) < 5:
+                continue
+
+            fecha = cols[0]
+            sucursal = cols[1]
+            recibo = cols[2]
+
+            bgs = parse_numeric(cols[3])
+            mgs = parse_numeric(cols[4])
+            busd = parse_numeric(cols[5]) if len(cols) > 5 else None
+            musd = parse_numeric(cols[6]) if len(cols) > 6 else None
+
+            try:
+                parsed_fecha = datetime.strptime(fecha, "%d/%m/%Y").date()
+            except Exception:
+                parse_df = pd.to_datetime(fecha, errors="coerce", dayfirst=True)
+                if pd.isna(parse_df):
+                    continue
+                parsed_fecha = parse_df.date()
+
+            def add_row(moneda: str, bultos: Optional[float], monto: Optional[float]) -> None:
+                if monto is None and bultos is None:
+                    return
+                registros.append(
+                    {
+                        "FECHA_RECIBO": parsed_fecha,
+                        "SUCURSAL": sucursal,
+                        "RECIBO": recibo,
+                        "BULTOS": int(bultos) if bultos is not None else None,
+                        "MONTO": float(monto or 0.0),
+                        "MONEDA": moneda,
+                        "ING_EGR": "IN" if section == "INGRESOS" else "OUT",
+                        "CLASIFICACION": "ATM",
+                        "FECHA_ARCHIVO": fecha_archivo,
+                        "MOTIVO_MOVIMIENTO": section,
+                        "AGENCIA": agencia,
+                        "ARCHIVO_ORIGEN": path.name,
+                    }
+                )
+
+            if bgs is not None or mgs is not None:
+                add_row("PYG", bgs, mgs)
+            if busd is not None or musd is not None:
+                add_row("USD", busd, musd)
+
+    if not registros:
+        return pd.DataFrame()
+
+    return pd.DataFrame(registros)
+
+
+# ------------------------------ MAPEOS DE SALIDA ------------------------------
+
+OUTPUT_FILES: Dict[str, str] = {
+    "EC_EFECT_BCO": "BRITIMP_EFECTBANCO.csv",
+    "EC_EFECT_ATM": "BRITIMP_EFECTATM.csv",
+    "INV_BILLETES_BCO": "BRITIMP_INVENTARIO_BANCO.csv",
+    "INV_BILLETES_ATM": "BRITIMP_INVENTARIO_ATM.csv",
+    "EC_BULTO_ATM": "BRITIMP_BULTOS_ATM.csv",
+}
+
+
+# ------------------------------ DETECCIÓN DE TIPO Y PARSEO ------------------------------
+
+def detect_sin_movimientos(path: Path) -> bool:
+    """Detecta si el archivo indica 'sin movimientos'."""
+    fname = path.name.upper()
+    return "SIN MOVIMIENTOS" in fname or "SIN MOVIMIENTO" in fname
+
+
+def process_file(
+    path: Path,
+    parent_agency_hint: Optional[str] = None,
+    DEBUG: bool = False,
+) -> Tuple[pd.DataFrame, Optional[str], Optional[str], bool]:
+    """
+    Procesa un archivo individual (PDF / XLSX / XLS) y devuelve:
+      - DataFrame resultante
+      - tipo de archivo lógico (clave en OUTPUT_FILES)
+      - agencia detectada
+      - flag es_itau (True si es DOCUMENTA/ITAU, False en caso contrario)
+    """
+    logger.info(f"Procesando archivo: {path}")
+
+    tipo = guess_tipo_from_filename(path.name)
+    if tipo is None:
+        logger.warning(f"[OMITIDO] No se pudo inferir tipo de archivo desde nombre: {path.name}")
+        return pd.DataFrame(), None, parent_agency_hint, False
+
+    try:
+        if path.suffix.lower() == ".pdf":
+            df = parse_ec_banco_pdf(path, DEBUG=DEBUG)
+        else:
+            if tipo == "EC_EFECT_BCO":
+                df = parse_ec_efect_bco_xlsx(path, DEBUG=DEBUG)
+            elif tipo == "EC_EFECT_ATM":
+                df = parse_ec_efect_atm_xlsx(path, DEBUG=DEBUG)
+            elif tipo in ("INV_BILLETES_BCO", "INV_BILLETES_ATM"):
+                df = parse_inventario_billetes_xlsx(path, tipo=tipo, DEBUG=DEBUG)
+            elif tipo == "EC_BULTO_ATM":
+                df = parse_ec_bultos_atm_xlsx(path, DEBUG=DEBUG)
+            else:
+                logger.warning(f"[OMITIDO] Tipo de archivo no soportado: {tipo}")
+                return pd.DataFrame(), None, parent_agency_hint, False
+    except Exception as e:
+        logger.error(f"[ERROR] Fallo el parseo de '{path.name}': {e}", exc_info=True)
+        return pd.DataFrame(), None, parent_agency_hint, False
+
+    if df.empty:
+        logger.warning(f"[VACÍO] No se obtuvieron registros desde '{path.name}'")
+        return df, tipo, parent_agency_hint, True
+
+    if "AGENCIA" not in df.columns or df["AGENCIA"].isna().all():
+        if parent_agency_hint:
+            df["AGENCIA"] = parent_agency_hint
+        else:
+            df["AGENCIA"] = None
+
+    agencia = None
+    if "AGENCIA" in df.columns:
+        agencias = df["AGENCIA"].dropna().unique()
+        if len(agencias) == 1:
+            agencia = str(agencias[0])
+        elif len(agencias) > 1:
+            agencia = str(agencias[0])
+
+    df["ARCHIVO_ORIGEN"] = path.name
+
+    full_text = ""
+    try:
+        if path.suffix.lower() == ".pdf" and PdfReader is not None:
+            full_text = extract_text_from_pdf(path)
+        elif path.suffix.lower() in (".xls", ".xlsx"):
+            xl = pd.ExcelFile(path)
+            texts = []
+            for sheet in xl.sheet_names:
+                tmp = pd.read_excel(xl, sheet_name=sheet, header=None)
+                texts.append(" ".join(tmp.astype(str).agg(" ".join, axis=1)))
+            full_text = "\n".join(texts)
+    except Exception:
+        full_text = ""
+
+    es_itau = is_documenta_itau(full_text) if full_text else True
+
+    if not es_itau:
+        logger.info(f"[OMITIDO] '{path.name}' no corresponde a DOCUMENTA/ITAU.")
+        return pd.DataFrame(), tipo, agencia or parent_agency_hint, False
+
+    logger.info(
+        f"[OK PARSE] '{path.name}' -> tipo={tipo}, registros={len(df)}, agencia={agencia or parent_agency_hint}"
+    )
+    return df, tipo, agencia or parent_agency_hint, True
+
+
+# ------------------------------ POST-PROCESAMIENTO ------------------------------
+
+def post_process_dataframes(data_dict: Dict[str, pd.DataFrame]) -> Dict[str, pd.DataFrame]:
+    """Aplica limpiezas finales a los dataframes: renombra, formatea y elimina columnas."""
+    processed_dict: Dict[str, pd.DataFrame] = {}
+    for tipo, df in data_dict.items():
+        if df.empty:
+            continue
+
+        df_copy = df.copy()
+
+        if "ARCHIVO_ORIGEN" in df_copy.columns:
+            df_copy = df_copy.drop(columns=["ARCHIVO_ORIGEN"])
+
+        if tipo.startswith("EC_"):
+            if "FECHA_OPERACION" in df_copy.columns:
+                df_copy = df_copy.rename(columns={"FECHA_OPERACION": "FECHA_RECIBO"})
+
+            for col in ["MONTO", "IMPORTE", "BULTOS"]:
+                if col in df_copy.columns:
+                    df_copy[col] = pd.to_numeric(df_copy[col], errors="coerce").astype("Int64")
+
+        if tipo.startswith("INV_"):
+            if "CJE_DEP" in df_copy.columns:
+                if "CALIDAD_CD" not in df_copy:
+                    df_copy["CALIDAD_CD"] = None
+                df_copy["CALIDAD_CD"] = df_copy["CALIDAD_CD"].fillna(df_copy["CJE_DEP"])
+                df_copy = df_copy.drop(columns=["CJE_DEP"])
+
+            for col in [
+                "DENOMINACION",
+                "CALIDAD_DEPOSITO",
+                "CALIDAD_CD",
+                "CALIDAD_CANJE",
+                "MONEDA",
+                "IMPORTE_TOTAL",
+            ]:
+                if col in df_copy.columns:
+                    df_copy[col] = pd.to_numeric(df_copy[col], errors="coerce").astype("Int64")
+
+        if tipo in FINAL_COLUMNS:
+            final_cols = [col for col in FINAL_COLUMNS[tipo] if col in df_copy.columns]
+            processed_dict[tipo] = df_copy[final_cols]
+        else:
+            processed_dict[tipo] = df_copy
+
+    return processed_dict
+
+
+# ------------------------------ ESCRITURA DE CONSOLIDADOS ------------------------------
+
+def write_all_consolidated(all_data: Dict[str, pd.DataFrame]) -> None:
+    """Escribe todos los DataFrames acumulados a sus respectivos archivos CSV, sobrescribiendo."""
+    outdir = today_folder()
+    logger.info("--- INICIANDO ESCRITURA DE ARCHIVOS CONSOLIDADOS ---")
+    for tipo, df in all_data.items():
+        if tipo not in OUTPUT_FILES or df.empty:
+            continue
+        outpath = outdir / OUTPUT_FILES[tipo]
+        try:
+            df.to_csv(outpath, index=False, encoding="utf-8-sig", sep=";")
+            logger.info(f"[CSV ESCRITO] {len(df)} registros guardados en '{outpath.name}'")
+        except Exception as e:
+            logger.error(f"[ERROR DE ESCRITURA] No se pudo guardar '{outpath.name}'. Detalles: {e}")
+
+
+# ------------------------------ MOVER ARCHIVOS A PROCESADO ------------------------------
+
+def move_original(path: Path, agencia: str, procesado_ok: bool) -> None:
+    """Mueve el archivo original a la carpeta de PROCESADO/{FECHA}/{AGENCIA}.
+
+    - PROCESADO/{YYYY-MM-DD}/{AGENCIA}/archivo_original.ext
+    - PROCESADO/{YYYY-MM-DD}/{AGENCIA}/archivo_original_OK_YYYYMMDD_HHMMSS.ext
+    """
+    today_str = datetime.now().strftime("%Y-%m-%d")
+    agencia_key = agencia.upper() if agencia and agencia.upper() in AGENCIES else "SIN_AGENCIA"
+
+    dest_dir = PROCESADO / today_str / agencia_key
+    dest_dir.mkdir(parents=True, exist_ok=True)
+
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    status = "OK" if procesado_ok else "ERROR"
+    processed_name = f"{path.stem}_{status}_{timestamp}{path.suffix}"
+
+    original_dest = dest_dir / path.name
+    processed_dest = dest_dir / processed_name
+
+    try:
+        shutil.copy2(str(path), str(original_dest))
+        shutil.move(str(path), str(processed_dest))
+        logger.info(
+            f"-> [MOVIDO] '{path.name}' a '{processed_dest}' (copia en '{original_dest.name}')"
+        )
+    except Exception as e:
+        logger.error(f"-> ¡ERROR! No se pudo mover/copiar el archivo '{path.name}'. Detalles: {e}")
+
+
+# ------------------------------ VALIDACIÓN DE CARPETAS PENDIENTES ------------------------------
+
+def validate_pending_agencies() -> bool:
+    """Verifica que cada carpeta de agencia bajo PENDIENTES exista y tenga al menos un archivo.
+    Si alguna no existe o está vacía, loguea el problema y devuelve False.
+    """
+    problemas: List[str] = []
+
+    for agencia in AGENCIES:
+        carpeta = PENDIENTES / agencia
+        if not carpeta.is_dir():
+            problemas.append(f"{agencia}: carpeta no existe -> {carpeta}")
+            continue
+        archivos = [p for p in carpeta.iterdir() if p.is_file()]
+        if not archivos:
+            problemas.append(f"{agencia}: carpeta vacía -> {carpeta}")
+
+    if problemas:
+        logger.error("Hay agencias sin archivos en la carpeta de pendientes. NO se procesará nada.")
+        for p in problemas:
+            logger.error(f" - {p}")
+        return False
+
+    return True
+
+
+# ------------------------------ SCANNER PRINCIPAL ------------------------------
+
+def collect_pending_files() -> List[Tuple[Path, Optional[str]]]:
+    """Recopila todos los archivos pendientes en las carpetas de agencias."""
+    results: List[Tuple[Path, Optional[str]]] = []
+    for agencia in AGENCIES:
+        base_dir = PENDIENTES / agencia
+        if not base_dir.is_dir():
+            continue
+        for p in base_dir.rglob("*"):
+            if (
+                p.is_file()
+                and p.suffix.lower() in (".xlsx", ".xls", ".pdf")
+                and not p.name.startswith("~")
+            ):
+                results.append((p, agencia))
+    return results
+
+
+# ------------------------------ MAIN ------------------------------
+
+def run(DEBUG: bool = False) -> Dict[str, int]:
+    """Función principal que orquesta todo el proceso."""
+    ensure_output_dirs()
+
+    if not validate_pending_agencies():
+        stats = {k: 0 for k in OUTPUT_FILES.keys()}
+        return stats
+
+    pendientes = collect_pending_files()
+    logger.info(f"Archivos encontrados para procesar: {len(pendientes)}")
+
+    all_dataframes: Dict[str, List[pd.DataFrame]] = {k: [] for k in OUTPUT_FILES}
+
+    for path, agencia_hint in pendientes:
+        df, tipo, agencia_final, es_itau = process_file(
+            path, parent_agency_hint=agencia_hint, DEBUG=DEBUG
+        )
+        procesado_exitoso = es_itau and (
+            not df.empty or (tipo is not None and detect_sin_movimientos(path))
+        )
+        if es_itau and tipo and tipo in all_dataframes and not df.empty:
+            all_dataframes[tipo].append(df)
+        move_original(path, agencia_final or agencia_hint, procesado_exitoso)
+        logger.info("-" * 50)
+
+    final_consolidated: Dict[str, pd.DataFrame] = {}
+    for tipo, df_list in all_dataframes.items():
+        if df_list:
+            final_consolidated[tipo] = pd.concat(df_list, ignore_index=True)
+
+    final_formatted = post_process_dataframes(final_consolidated)
+    write_all_consolidated(final_formatted)
+
+    stats = {k: 0 for k in OUTPUT_FILES.keys()}
+    for tipo, df in final_formatted.items():
+        stats[tipo] = len(df)
+
+    resumen_partes: List[str] = []
+    for k, v in stats.items():
+        resumen_partes.append(f"{k}: {v}")
+    resumen_texto = ", ".join(resumen_partes)
+    logger.info(f"[RESUMEN FINAL] Registros añadidos: {resumen_texto}")
+
+    logger.info("=" * 10 + " FIN DE EJECUCIÓN " + "=" * 10 + "\n")
+    return stats
+
+
+if __name__ == "__main__":
+    #DEBUG = "DEBUG" in sys.argv
+    run()
