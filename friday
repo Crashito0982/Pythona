@@ -8,7 +8,6 @@ import re
 import sys
 import shutil
 import unicodedata
-#import logging
 from loguru import logger
 from pathlib import Path
 from datetime import datetime, timedelta
@@ -26,12 +25,11 @@ except ImportError:
 # ------------------------------ CONFIGURACIÓN DE RUTAS Y COLUMNAS FINALES ------------------------------
 
 AGENCIA_ALIASES = {
-    'ASU': ['ASUNCION', 'ASU'],
-    'CDE': ['CIUDAD DEL ESTE', 'CDE'],
-    'ENC': ['ENCARNACION', 'ENC'],
-    'CON': ['CONCEPCION', 'CON']
+    "ASU": ["ASUNCION", "ASU"],
+    "CDE": ["CIUDAD DEL ESTE", "CDE"],
+    "ENC": ["ENCARNACION", "ENC"],
+    "CON": ["CONCEPCION", "CON"],
 }
-
 
 FINAL_COLUMNS = {
     "EC_EFECT_BCO": [
@@ -103,18 +101,15 @@ FINAL_COLUMNS = {
 
 
 def resolve_root() -> Path:
-    """Determina el directorio raíz del proyecto."""
-    here = Path(__file__).resolve().parent if "__file__" in globals() else Path.cwd()
-    if (here / "PENDIENTES").exists() or (here.name.upper() == "BRITIMP"):
-        return here
-    if (here / "BRITIMP").exists():
-        return here / "BRITIMP"
-    return here
+    """Devuelve la carpeta donde está este script (.py), o el cwd si no existe __file__."""
+    if "__file__" in globals():
+        return Path(__file__).resolve().parent
+    return Path.cwd()
 
 
-# En Jupyter, podés dejar esta ruta local;
-# en producción la cambiás por la ruta del share de red.
-ROOT = Path("./DATA/BRITIMP")  # En producción, reemplazar por ruta de red BRITIMP
+# En esta versión, ROOT es SIEMPRE la carpeta donde está este .py (BRITIMP)
+ROOT = resolve_root()
+
 # En la nueva estructura, la carpeta raíz BRITIMP es la de pendientes:
 # dentro estarán las carpetas de agencias (ASU, CDE, ENC, OVD)
 PENDIENTES = ROOT
@@ -123,7 +118,7 @@ PENDIENTES = ROOT
 PROCESADO = ROOT / "PROCESADO"
 CONSOLIDADO = ROOT / "CONSOLIDADO"
 
-# Lista de agencias actualizada
+# Lista de agencias
 AGENCIES = ["ASU", "CDE", "ENC", "OVD"]
 
 
@@ -131,13 +126,9 @@ def ensure_output_dirs() -> None:
     """Crea las carpetas PROCESADO y CONSOLIDADO si no existen."""
     PROCESADO.mkdir(parents=True, exist_ok=True)
     CONSOLIDADO.mkdir(parents=True, exist_ok=True)
-#ensure_dirs()
+
 
 # ------------------------------ LOGGING ------------------------------
-
-# Si quisieras reactivar logging estándar:
-# import logging
-# _LOGGER: Optional[logging.Logger] = None
 
 def today_folder() -> Path:
     """Crea y devuelve la ruta a la carpeta de consolidados del día de hoy."""
@@ -145,35 +136,6 @@ def today_folder() -> Path:
     outdir = CONSOLIDADO / today
     outdir.mkdir(parents=True, exist_ok=True)
     return outdir
-
-#def setup_logger() -> logging.Logger:
-#    """Configura el logger para que escriba en archivo y en consola."""
-#    global _LOGGER
-#    if _LOGGER:
-#        return _LOGGER
-#
-#    log_dir = Path("./logs")
-#    log_dir.mkdir(exist_ok=True)
-#    log_path = log_dir / f"britimp_consolidado_{datetime.now().strftime('%Y%m%d')}.log"
-#
-#    logger_ = logging.getLogger("britimp_consolidado")
-#    logger_.setLevel(logging.INFO)
-#
-#    fh = logging.FileHandler(log_path, encoding='utf-8', mode='a')
-#    ch = logging.StreamHandler(sys.stdout)
-#
-#    formatter = logging.Formatter(
-#        "%(asctime)s [%(levelname)s] %(message)s",
-#        datefmt="%Y-%m-%d %H:%M:%S"
-#    )
-#    fh.setFormatter(formatter)
-#    ch.setFormatter(formatter)
-#
-#    logger_.addHandler(fh)
-#    logger_.addHandler(ch)
-#
-#    _LOGGER = logger_
-#    return logger_
 
 
 # ------------------------------ HELPERS GENERALES ------------------------------
@@ -295,8 +257,6 @@ def parse_ec_banco_pdf(path: Path, DEBUG: bool = False) -> pd.DataFrame:
         ]
     )
 
-    # TODO: aquí deberías implementar el parseo real de las líneas del PDF.
-    # De momento, devolvemos un DF vacío con las columnas correctas.
     if DEBUG:
         logger.debug(f"[PDF PARSE] Parser EC BANCO PDF aún no implementado para '{path.name}'")
 
@@ -1012,5 +972,4 @@ def run(DEBUG: bool = False) -> Dict[str, int]:
 
 
 if __name__ == "__main__":
-    #DEBUG = "DEBUG" in sys.argv
     run()
