@@ -1,0 +1,1437 @@
+###CONSOLIDADO PROSEGUR
+
+
+import os
+import re
+import shutil
+import unicodedata
+from datetime import datetime
+from pathlib import Path
+from typing import Optional, Union, List, Dict
+
+import numpy as np
+import pandas as pd
+import openpyxl  # asegura engine para to_excel
+
+
+###############################
+### DEFINICION DE VARIABLES ###
+###############################
+FULL_PATH = os.path.join('.', 'PROSEGUR', 'PENDIENTES')
+FULL_PATH_PROCESADO = os.path.join('.', 'PROSEGUR', 'PROCESADO')
+FULL_PATH_CONSOLIDADO = os.path.join('.', 'PROSEGUR', 'CONSOLIDADO')
+
+# Asegurar que existan las carpetas
+os.makedirs(FULL_PATH, exist_ok=True)
+os.makedirs(FULL_PATH_PROCESADO, exist_ok=True)
+os.makedirs(FULL_PATH_CONSOLIDADO, exist_ok=True)
+
+
+#########################
+### FUNCIONES HELPERS ###
+#########################
+
+def _extraer_saldos_desde_fila(strip_cells: List[str],
+                               etiqueta: str = 'SALDO ANTERIOR') -> List[str]:
+    """
+    Dada una fila ya strippeada (lista de strings), busca la celda que contenga
+    'Saldo Anterior' (ignorando mayúsculas y acentos) y devuelve todos los
+    valores numéricos no vacíos que aparezcan a su derecha, en orden.
+    Ejemplos de retorno:
+        ['46.450,00', '61.300.473.000']
+        ['67', '11.880.000.000', '2', '40.000,00']
+    """
+    etiqueta_norm = _strip_accents(etiqueta).upper()
+
+    for idx, celda in enumerate(strip_cells):
+        celda_norm = _strip_accents(str(celda)).upper()
+        if etiqueta_norm in celda_norm:
+            valores: List[str] = []
+            for j in range(idx + 1, len(strip_cells)):
+                v = str(strip_cells[j]).strip()
+                if not v:
+                    continue
+                # Consideramos "numérico" si tiene al menos un dígito
+                if re.search(r'\d', v):
+                    valores.append(v)
+            return valores
+
+    return []
+
+
+def _strip_accents(s: str) -> str:
+    return ''.join(c for c in unicodedata.normalize('NFD', s) if unicodedata.category(c) != 'Mn')
+
+
+def _first_non_empty_after(row_vals: List[str], start_idx: int) -> Optional[int]:
+    """Devuelve el índice de la primera celda no vacía a partir de start_idx+1, o None."""
+    for i in range(start_idx + 1, len(row_vals)):
+        if str(row_vals[i]).strip() != '':
+            return i
+    return None
+
+
+def _get_cell(row_vals: List[str], idx: Optional[int], default: str = '') -> str:
+    if idx is None or idx >= len(row_vals):
+        return default
+    v = str(row_vals[idx]).strip()
+    return v if v != '' else default
+
+
+def _only_digits(s: str) -> str:
+    """Devuelve solo dígitos (para recibo), sin cortar ceros a la izquierda."""
+    return ''.join(ch for ch in str(s) if ch.isdigit())
+
+
+def _ordenar_y_renombrar_columnas_ec(df: pd.DataFrame) -> pd.DataFrame:
+    """Normaliza encabezados y asegura el orden final esperado para EC_*."""
+    df.columns = [str(c).replace(' ', '_').upper() for c in df.columns]
+    rename_map = {'FECHA_OPER': 'FECHA', 'MOTIVO MOVIMIENTO': 'MOTIVO_MOVIMIENTO'}
+    df = df.rename(columns=rename_map)
+    orden_final = [
+        'FECHA', 'SUCURSAL', 'RECIBO', 'BULTOS', 'GUARANIES', 'DOLARES',
+        'ING_EGR', 'CLASIFICACION', 'FECHA_ARCHIVO', 'MOTIVO_MOVIMIENTO', 'AGENCIA'
+    ]
+    for col in orden_final:
+        if col not in df.columns:
+            df[col] = ''
+    return df[orden_final]
+
+
+def encontrar_fecha(texto: str) -> Optional[str]:
+    """Encuentra dd/mm/yyyy en un texto; devuelve la primera coincidencia o None."""
+    if not texto:
+        return None
+    m = re.search(r'(\d{1,2}/\d{1,2}/\d{4})', texto)
+    return m.group(1) if m else None
+
+
+def encontrar_fecha_en_columna(serie: pd.Series) -> Optional[str]:
+    """Busca la primera fecha válida dd/mm/yyyy en una serie/columna libre."""
+    for val in serie.astype(str).tolist():
+        f = encontrar_fecha(val)
+        if f:
+            return f
+    return None
+
+
+def get_agencia(linea_cabecera: str) -> str:
+    """
+    Extrae la agencia de una línea tipo 'PROSEGUR PARAGUAY S.A. (SUCURSAL: Ciudad del Este)'.
+    Si no encuentra, devuelve ''.
+    """
+    if not linea_cabecera:
+        return ''
+    m = re.search(r'SUCURSAL:\s*([^)]+)\)', linea_cabecera, flags=re.IGNORECASE)
+    return m.group(1).strip() if m else ''
+
+def _normaliza_moneda(token: str) -> str:
+    """Normaliza a: GUARANIES, DOLARES, EUROS, REALES, PESOS."""
+    t = _strip_accents(str(token)).upper()
+    if 'GUARANI' in t:
+        return 'GUARANIES'
+    if 'DOLAR' in t or 'DOLARE' in t or 'USD' in t:
+        return 'DOLARES'
+    if 'EURO' in t or 'EUR' in t:
+        return 'EUROS'
+    if 'REAL' in t or 'BRL' in t:
+        return 'REALES'
+    if 'PESO' in t or 'ARS' in t:
+        return 'PESOS'
+    return t
+
+
+def _guess_currency_from_sheet_name(sheet_name: str) -> str:
+    """Intenta inferir la moneda a partir del nombre de la hoja."""
+    n = _strip_accents(str(sheet_name)).upper()
+    if any(k in n for k in ['USD', 'DOLAR', 'DOLARES']):
+        return 'DOLARES'
+    if any(k in n for k in ['EUR', 'EURO', 'EUROS']):
+        return 'EUROS'
+    if any(k in n for k in ['BRL', 'REAL', 'REALES']):
+        return 'REALES'
+    if any(k in n for k in ['ARS', 'PESO', 'PESOS', 'ARG']):
+        return 'PESOS'
+    if any(k in n for k in ['PYG', 'GUARANI']):
+        return 'GUARANIES'
+    return ''  # desconocido
+
+
+def _leer_hojas_excel(path_entrada: str, sheet_name=None) -> dict:
+    """
+    Devuelve un dict {nombre_hoja: DataFrame} según el parámetro.
+    None -> todas las hojas; int/str -> una sola; lista -> solo esas.
+    """
+    if sheet_name is None:
+        return pd.read_excel(path_entrada, sheet_name=None, header=None, dtype=str)
+    if isinstance(sheet_name, (list, tuple)):
+        return pd.read_excel(path_entrada, sheet_name=list(sheet_name), header=None, dtype=str)
+    # un solo nombre/índice
+    df = pd.read_excel(path_entrada, sheet_name=sheet_name, header=None, dtype=str)
+    return {sheet_name: df}
+
+
+def _ordenar_y_renombrar_columnas_ec_banco(df: pd.DataFrame) -> pd.DataFrame:
+    """Normaliza encabezados y orden final para EC_BANCO (usa IMPORTE + MONEDA)."""
+    df.columns = [str(c).replace(' ', '_').upper() for c in df.columns]
+    df = df.rename(columns={
+        'FECHA_OPER': 'FECHA',
+        'MONTO': 'IMPORTE',
+        'MOTIVO MOVIMIENTO': 'MOTIVO_MOVIMIENTO',
+    })
+    orden_final = [
+        'FECHA', 'SUCURSAL', 'RECIBO', 'BULTOS', 'IMPORTE', 'MONEDA',
+        'ING_EGR', 'CLASIFICACION', 'FECHA_ARCHIVO', 'MOTIVO_MOVIMIENTO',
+        'AGENCIA', 'HOJA_ORIGEN'
+    ]
+    for col in orden_final:
+        if col not in df.columns:
+            df[col] = ''
+    return df[orden_final]
+
+
+def _is_zero_like(s: str) -> bool:
+    """True si el string representa 0 (con o sin separadores)."""
+    t = str(s).replace(',', '').replace('.', '').strip()
+    return t == '' or t == '0'
+
+
+def _ordenar_y_renombrar_columnas_bultos(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Normaliza y ordena para BULTOS_* en formato LONG:
+    usa columnas: FECHA,SUCURSAL,RECIBO,BULTOS,MONEDA,IMPORTE,ING_EGR,CLASIFICACION,FECHA_ARCHIVO,MOTIVO_MOVIMIENTO,AGENCIA
+    """
+    df.columns = [str(c).replace(' ', '_').upper() for c in df.columns]
+    rename_map = {'FECHA_OPER': 'FECHA'}
+    df = df.rename(columns=rename_map)
+    orden_final = [
+        'FECHA', 'SUCURSAL', 'RECIBO', 'BULTOS', 'MONEDA', 'IMPORTE',
+        'ING_EGR', 'CLASIFICACION', 'FECHA_ARCHIVO', 'MOTIVO_MOVIMIENTO', 'AGENCIA'
+    ]
+    for col in orden_final:
+        if col not in df.columns:
+            df[col] = ''
+    return df[orden_final]
+
+def _normaliza_moneda_iso(token: str) -> str:
+    """
+    Devuelve códigos ISO comunes: PYG, USD, EUR, BRL, ARS.
+    Tolera variantes locales (Gs, U$S, US$, R$, €, 'guaraníes', etc).
+    """
+    t = _strip_accents(str(token)).upper().strip()
+
+    # Casos específicos primero (evitar colisiones con '$')
+    if any(k in t for k in ['PYG', 'GS', 'G$', 'G ', '₲', 'GUARANI', 'GUARANIES']):
+        return 'PYG'
+    if any(k in t for k in ['USD', 'US$', 'U$S', 'DOLAR', 'DOLARES']):
+        return 'USD'
+    if any(k in t for k in ['EUR', '€', 'EURO', 'EUROS']):
+        return 'EUR'
+    if any(k in t for k in ['BRL', 'R$', 'REAL', 'REALES']):
+        return 'BRL'
+    if any(k in t for k in ['ARS', 'PESO', 'PESOS', 'ARG']):
+        return 'ARS'
+
+    # Heurística: si aparece '$' y no se detectó arriba, preferimos USD
+    if '$' in t:
+        return 'USD'
+    return t  # fallback (por si usan un código no previsto)
+
+def _txt(x) -> str:
+    return "" if pd.isna(x) else str(x).strip()
+
+def _upper(x) -> str:
+    return re.sub(r"\s+", " ", _txt(x)).upper()
+
+def _to_int(x) -> Optional[int]:
+    """Convierte valores tipo '3.000', '3,000', '3000.0' a int. Devuelve None si no es número."""
+    if x is None or (isinstance(x, float) and pd.isna(x)):
+        return None
+    if isinstance(x, (int, float)) and not isinstance(x, bool):
+        try:
+            return int(round(float(x)))
+        except Exception:
+            pass
+    s = _txt(x).replace("\xa0", " ").strip()
+    if s == "":
+        return None
+    if re.fullmatch(r"\d+\.\d+", s):
+        return int(float(s))
+    digits = re.sub(r"[^\d\-]", "", s)
+    if digits in ("", "-", "--"):
+        return None
+    try:
+        return int(digits)
+    except Exception:
+        return None
+
+
+
+###############################################
+### 1) EC_ATM: Estado de Cuenta de ATM (def) ###
+###############################################
+
+def get_ec_atm(fecha_ejecucion: datetime,
+               filename: str,
+               dir_entrada: str,
+               dir_consolidado: str,
+               sheet_name: Union[int, str] = 0) -> Optional[str]:
+    """
+    Procesa un archivo EC_ATM*.* desde dir_entrada y genera un Excel procesado en dir_consolidado.
+    Devuelve la ruta de salida o None si no se obtuvieron registros.
+    """
+    path_entrada = os.path.join(dir_entrada, filename)
+    p = Path(path_entrada)
+    stem_out = p.stem + '_PROCESADO'
+    path_salida = os.path.join(dir_consolidado, f'{stem_out}.xlsx')
+
+    # Lectura cruda (sin encabezados) y normalización básica
+    df_raw = pd.read_excel(path_entrada, sheet_name=sheet_name, header=None, dtype=str).fillna('')
+
+    rx_fecha_cell = re.compile(r'^\s*\d{1,2}/\d{1,2}/\d{4}\s*$')
+    rx_totales = re.compile(r'\b(TOTAL|SUBTOTAL)\b', re.IGNORECASE)
+
+    agencia = ''
+    fecha_archivo = ''
+    clasificacion = 'ATM'
+    ing_egr = ''  # IN / OUT
+    motivo_actual = ''
+
+    registros: List[Dict[str, str]] = []
+
+    # NUEVO: saldos anteriores que se aplican a TODAS las filas de este archivo
+    saldo_ant_usd = ''
+    saldo_ant_pyg = ''
+
+    for _, row in df_raw.iterrows():
+        cells = [str(x) if x is not None else '' for x in row.values]
+        strip_cells = [c.strip() for c in cells]
+        line_join = ' '.join([c for c in strip_cells if c])
+        if not line_join:
+            continue
+
+        upper_join = _strip_accents(line_join).upper()
+
+        # Cabeceras / metadatos
+        if 'PROSEGUR PARAGUAY S.A.' in upper_join:
+            # e.g. "PROSEGUR PARAGUAY S.A. (SUCURSAL: Ciudad del Este)"
+            ag = get_agencia(line_join)
+            if ag:
+                agencia = ag
+            continue
+
+        if 'ESTADO DE CUENTA DE' in upper_join:
+            m_f = re.search(r'AL:\s*(\d{1,2}/\d{1,2}/\d{4})', line_join, flags=re.IGNORECASE)
+            if m_f:
+                fecha_archivo = m_f.group(1)
+            continue
+
+        if upper_join == 'INGRESOS':
+            ing_egr = 'IN'
+            motivo_actual = ''
+            continue
+
+        if upper_join == 'EGRESOS':
+            ing_egr = 'OUT'
+            motivo_actual = ''
+            continue
+
+        if 'INFORME DE PROCESOS' in upper_join:
+            # fin del bloque útil
+            break
+
+        if rx_totales.search(line_join):
+            # ignorar líneas de totales/subtotales
+            continue
+
+        # Detectar si la fila es "motivo" o "detalle"
+        date_idx = next((i for i, c in enumerate(strip_cells) if rx_fecha_cell.match(c)), None)
+
+        if ing_egr and date_idx is None:
+            # Fila de MOTIVO (texto)
+            motivo_actual = line_join.strip()
+            continue
+
+        # Fila de DETALLE (tiene una celda fecha)
+        if ing_egr and motivo_actual and date_idx is not None:
+            fecha_oper = strip_cells[date_idx]
+
+            # SUCURSAL: primera celda no vacía después de la fecha
+            suc_idx = _first_non_empty_after(strip_cells, date_idx)
+            sucursal = _get_cell(strip_cells, suc_idx, default='')
+
+            # RECIBO: primera no vacía después de SUCURSAL (no parseamos número del texto de sucursal)
+            rec_idx = _first_non_empty_after(strip_cells, suc_idx) if suc_idx is not None else None
+            recibo_raw = _get_cell(strip_cells, rec_idx, default='')
+            recibo_digits = _only_digits(recibo_raw)
+            recibo = recibo_digits if recibo_digits != '' else recibo_raw
+
+            # BULTOS
+            bul_idx = _first_non_empty_after(strip_cells, rec_idx) if rec_idx is not None else None
+            bultos = _get_cell(strip_cells, bul_idx, default='')
+
+            # GUARANIES
+            gua_idx = _first_non_empty_after(strip_cells, bul_idx) if bul_idx is not None else None
+            guaranies = _get_cell(strip_cells, gua_idx, default='0') or '0'
+
+            # DOLARES
+            usd_idx = _first_non_empty_after(strip_cells, gua_idx) if gua_idx is not None else None
+            dolares = _get_cell(strip_cells, usd_idx, default='0') or '0'
+
+            registros.append({
+                'FECHA_OPER': fecha_oper,
+                'SUCURSAL': sucursal,
+                'RECIBO': recibo,
+                'BULTOS': bultos,
+                'GUARANIES': guaranies,
+                'DOLARES': dolares,
+                'ING_EGR': ing_egr,
+                'CLASIFICACION': clasificacion,
+                'FECHA_ARCHIVO': fecha_archivo,
+                'MOTIVO_MOVIMIENTO': motivo_actual,
+                'AGENCIA': agencia
+            })
+
+    # DataFrame final ordenado
+    df_out = pd.DataFrame(registros)
+    if df_out.empty:
+        # Creamos estructura vacía para no romper el flujo, pero avisamos
+        df_out = pd.DataFrame(columns=[
+            'FECHA_OPER', 'SUCURSAL', 'RECIBO', 'BULTOS', 'GUARANIES', 'DOLARES',
+            'ING_EGR', 'CLASIFICACION', 'FECHA_ARCHIVO', 'MOTIVO_MOVIMIENTO', 'AGENCIA'
+        ])
+        print(f'[EC_ATM] {filename}: No se detectaron registros válidos.')
+
+    df_out = _ordenar_y_renombrar_columnas_ec(df_out)
+    df_out.to_excel(path_salida, index=False)
+    print(f'[EC_ATM] Guardado: {path_salida}')
+    return path_salida
+
+
+##################################################
+### 1) EC_BCO: Estado de Cuenta de BANCO (def) ###
+##################################################
+
+def get_ec_banco(fecha_ejecucion: datetime,
+                 filename: str,
+                 dir_entrada: str,
+                 dir_consolidado: str,
+                 sheet_name=None) -> Optional[str]:
+    """
+    Procesa un archivo EC_BANCO*.xlsx desde dir_entrada y genera un Excel procesado en dir_consolidado.
+    Usa IMPORTE + MONEDA (una sola columna de monto con su moneda).
+    Devuelve la ruta de salida o None si no se obtuvieron registros.
+    """
+    path_entrada = os.path.join(dir_entrada, filename)
+    p = Path(path_entrada)
+    stem_out = p.stem + '_PROCESADO'
+    path_salida = os.path.join(dir_consolidado, f'{stem_out}.xlsx')
+
+    hojas = _leer_hojas_excel(path_entrada, sheet_name=sheet_name)
+
+    # Regex útiles
+    rx_fecha_linea = re.compile(r'^\s*(\d{1,2}/\d{1,2}/\d{4})\b')
+    rx_totales = re.compile(r'\b(TOTAL|SUBTOTAL)\b', re.IGNORECASE)
+    rx_moneda = re.compile(r'\b(GUARAN[IÍ]ES|D[ÓO]LARES|EUROS?|REALES?|PESOS?)\b', re.IGNORECASE)
+
+    mapa_clasif = {
+        'BANCO': 'BCO',
+        'ATM': 'ATM',
+        'BULTOS DE BANCO': 'BULTO BCO',
+        'BULTOS DE ATM': 'BULTO ATM',
+    }
+
+    registros = []
+
+    for nombre_hoja, df in hojas.items():
+        df = df.fillna('')
+
+        agencia = ''
+        fecha_archivo = ''
+        clasificacion = ''
+        ing_egr = ''           # IN / OUT
+        motivo_actual = ''
+
+        # Moneda por defecto: intento por nombre de hoja; si no, GUARANIES
+        moneda_actual = _guess_currency_from_sheet_name(nombre_hoja) or 'GUARANIES'
+
+        for _, row in df.iterrows():
+            linea = ' '.join([str(x).strip() for x in row.values if str(x).strip()])
+            if not linea:
+                continue
+
+            linea_up = _strip_accents(linea).upper()
+
+            # Agencia
+            if 'PROSEGUR PARAGUAY S.A.' in linea_up:
+                m = re.search(r'SUCURSAL:\s*([^)]+)\)', linea, flags=re.IGNORECASE)
+                if m:
+                    agencia = m.group(1).strip()
+                continue
+
+            # Clasificación y fecha de archivo
+            if 'ESTADO DE CUENTA DE' in linea_up:
+                m_tipo = re.search(r'ESTADO DE CUENTA DE\s+(.*?)\s+AL:', linea, flags=re.IGNORECASE)
+                if m_tipo:
+                    texto = m_tipo.group(1).strip()
+                    texto_norm = _strip_accents(texto).upper()
+                    clasificacion = mapa_clasif.get(texto_norm, texto.strip())
+                m_f = re.search(r'AL:\s*(\d{1,2}/\d{1,2}/\d{4})', linea, flags=re.IGNORECASE)
+                if m_f:
+                    fecha_archivo = m_f.group(1)
+                continue
+
+            # Secciones IN/OUT
+            if linea_up == 'INGRESOS':
+                ing_egr = 'IN'
+                motivo_actual = ''
+                continue
+            if linea_up == 'EGRESOS':
+                ing_egr = 'OUT'
+                motivo_actual = ''
+                continue
+
+            # Fin del bloque útil
+            if 'INFORME DE PROCESOS' in linea_up:
+                break
+
+            # Saltar totales/subtotales
+            if rx_totales.search(linea):
+                continue
+
+            # Detectar/actualizar moneda en encabezados
+            m_moneda = rx_moneda.search(linea)
+            if m_moneda:
+                moneda_actual = _normaliza_moneda(m_moneda.group(1))
+                continue
+
+            # Encabezado de motivo (línea no-fecha dentro de IN/OUT)
+            if ing_egr and not rx_fecha_linea.match(linea):
+                motivo_actual = linea.strip()
+                continue
+
+            # Fila de detalle (comienza con fecha)
+            m_date = rx_fecha_linea.match(linea)
+            if ing_egr and motivo_actual and m_date:
+                parts = linea.split()
+                if not parts:
+                    continue
+
+                fecha_oper = parts[0]
+
+                # Índice del recibo (primer número con al menos 6 dígitos)
+                idx_rec = next(
+                    (i for i, p in enumerate(parts[1:], 1) if re.fullmatch(r'\d{6,}', p)),
+                    None
+                )
+                if idx_rec is None:
+                    # si no hay recibo claro, omitimos para evitar falsos positivos
+                    continue
+
+                sucursal = ' '.join(parts[1:idx_rec]).strip()
+                recibo = parts[idx_rec]
+                bultos = parts[idx_rec + 1] if idx_rec + 1 < len(parts) else ''
+                importe = parts[idx_rec + 2] if idx_rec + 2 < len(parts) else ''
+
+                registros.append({
+                    'HOJA_ORIGEN': nombre_hoja,
+                    'AGENCIA': agencia,
+                    'FECHA_ARCHIVO': fecha_archivo,
+                    'ING_EGR': ing_egr,
+                    'CLASIFICACION': clasificacion,
+                    'MOTIVO MOVIMIENTO': motivo_actual,  # se normaliza luego
+                    'FECHA_OPER': fecha_oper,
+                    'SUCURSAL': sucursal,
+                    'RECIBO': recibo,
+                    'BULTOS': bultos,
+                    'MONEDA': moneda_actual,
+                    'MONTO': importe
+                })
+
+    # DataFrame base (sin cheques)
+    df_out = pd.DataFrame(registros, columns=[
+        'HOJA_ORIGEN', 'AGENCIA', 'FECHA_ARCHIVO', 'ING_EGR', 'CLASIFICACION',
+        'MOTIVO MOVIMIENTO', 'FECHA_OPER', 'SUCURSAL',
+        'RECIBO', 'BULTOS', 'MONEDA', 'MONTO'
+    ])
+
+    if df_out.empty:
+        # Creamos estructura vacía para no romper el flujo
+        df_out = pd.DataFrame(columns=[
+            'HOJA_ORIGEN', 'AGENCIA', 'FECHA_ARCHIVO', 'ING_EGR', 'CLASIFICACION',
+            'MOTIVO MOVIMIENTO', 'FECHA_OPER', 'SUCURSAL',
+            'RECIBO', 'BULTOS', 'MONEDA', 'MONTO'
+        ])
+        print(f'[EC_BANCO] {filename}: No se detectaron registros válidos.')
+
+    # Normalizar encabezados y ordenar
+    df_out = df_out.rename(columns={'MOTIVO MOVIMIENTO': 'MOTIVO_MOVIMIENTO'})
+    df_out = _ordenar_y_renombrar_columnas_ec_banco(df_out)
+
+    # Guardar
+    df_out.to_excel(path_salida, index=False)
+    print(f'[EC_BANCO] Guardado: {path_salida}')
+    return path_salida
+
+########################################################
+### 1) EC_BULTOS_ATM: Estado Cuenta BULTOS ATM (def) ###
+########################################################
+
+def get_ec_bultos_atm(fecha_ejecucion: datetime,
+                      filename: str,
+                      dir_entrada: str,
+                      dir_consolidado: str,
+                      sheet_name: Union[int, str] = 0,
+                      descartar_usd_cero: bool = True) -> Optional[str]:
+    """
+    Procesa 'EC_BULTOS_ATM*.xlsx' en formato LONG (una fila por moneda: PYG, USD).
+    - Genera salida en dir_consolidado con sufijo '_PROCESADO.xlsx'
+    - Si descartar_usd_cero=True, no genera fila USD cuando IMPORTE USD==0
+    Devuelve la ruta de salida o None si no hubo registros.
+    """
+    path_entrada = os.path.join(dir_entrada, filename)
+    p = Path(path_entrada)
+    stem_out = p.stem + '_PROCESADO'
+    path_salida = os.path.join(dir_consolidado, f'{stem_out}.xlsx')
+
+    df_x = pd.read_excel(path_entrada, sheet_name=sheet_name, header=None, dtype=str).fillna('')
+
+    rx_fecha_cell = re.compile(r'^\s*\d{1,2}/\d{1,2}/\d{4}\s*$')
+    rx_totales = re.compile(r'\b(TOTAL|SUBTOTAL)\b', re.IGNORECASE)
+
+    agencia = ''
+    fecha_archivo = ''
+    clasificacion = 'ATM'
+    ing_egr = ''
+    motivo_actual = ''
+
+    registros: List[Dict[str, str]] = []
+
+    for _, row in df_x.iterrows():
+        cells = [str(x) if x is not None else '' for x in row.values]
+        strip_cells = [c.strip() for c in cells]
+        line_join = ' '.join([c for c in strip_cells if c])
+        if not line_join:
+            continue
+
+        upper_join = _strip_accents(line_join).upper()
+
+        # Encabezados
+        if 'PROSEGUR PARAGUAY S.A.' in upper_join:
+            m = re.search(r'SUCURSAL:\s*([^)]+)\)', line_join, flags=re.IGNORECASE)
+            if m:
+                agencia = m.group(1).strip()
+            continue
+
+        if 'ESTADO DE CUENTA DE BULTOS DE ATM' in upper_join:
+            m_f = re.search(r'AL:\s*(\d{1,2}/\d{1,2}/\d{4})', line_join, flags=re.IGNORECASE)
+            if m_f:
+                fecha_archivo = m_f.group(1)
+            continue
+
+        if upper_join == 'INGRESOS':
+            ing_egr = 'IN'; motivo_actual = ''; continue
+        if upper_join == 'EGRESOS':
+            ing_egr = 'OUT'; motivo_actual = ''; continue
+
+        if 'INFORME DE PROCESOS' in upper_join:
+            break
+        if rx_totales.search(line_join):
+            continue
+
+        # Buscar fecha en la fila
+        date_idx = next((i for i, c in enumerate(strip_cells) if rx_fecha_cell.match(c)), None)
+
+        # Si no hay fecha, puede ser MOTIVO
+        if ing_egr and date_idx is None:
+            motivo_actual = line_join.strip()
+            continue
+
+        # Fila de detalle
+        if ing_egr and motivo_actual and date_idx is not None:
+            fecha_oper = strip_cells[date_idx]
+
+            suc_idx = _first_non_empty_after(strip_cells, date_idx)
+            sucursal = _get_cell(strip_cells, suc_idx, default='')
+
+            rec_idx = _first_non_empty_after(strip_cells, suc_idx) if suc_idx is not None else None
+            recibo_raw = _get_cell(strip_cells, rec_idx, default='')
+            recibo_digits = _only_digits(recibo_raw)
+            recibo = recibo_digits if recibo_digits != '' else recibo_raw
+
+            # Bultos y montos por moneda: PYG primero, luego USD
+            b_pyg_idx = _first_non_empty_after(strip_cells, rec_idx)
+            bultos_pyg = _get_cell(strip_cells, b_pyg_idx, default='0') or '0'
+
+            gua_idx = _first_non_empty_after(strip_cells, b_pyg_idx)
+            guaranies = _get_cell(strip_cells, gua_idx, default='0') or '0'
+
+            b_usd_idx = _first_non_empty_after(strip_cells, gua_idx)
+            bultos_usd = _get_cell(strip_cells, b_usd_idx, default='0') or '0'
+
+            usd_idx = _first_non_empty_after(strip_cells, b_usd_idx)
+            dolares = _get_cell(strip_cells, usd_idx, default='0') or '0'
+
+            # PYG
+            registros.append({
+                'FECHA_OPER': fecha_oper,
+                'SUCURSAL': sucursal,
+                'RECIBO': recibo,
+                'BULTOS': bultos_pyg,
+                'MONEDA': 'PYG',
+                'IMPORTE': guaranies,
+                'ING_EGR': ing_egr,
+                'CLASIFICACION': clasificacion,
+                'FECHA_ARCHIVO': fecha_archivo,
+                'MOTIVO_MOVIMIENTO': motivo_actual,
+                'AGENCIA': agencia
+            })
+
+            # USD (opcional si importe != 0)
+            if not (descartar_usd_cero and _is_zero_like(dolares)):
+                registros.append({
+                    'FECHA_OPER': fecha_oper,
+                    'SUCURSAL': sucursal,
+                    'RECIBO': recibo,
+                    'BULTOS': bultos_usd,
+                    'MONEDA': 'USD',
+                    'IMPORTE': dolares,
+                    'ING_EGR': ing_egr,
+                    'CLASIFICACION': clasificacion,
+                    'FECHA_ARCHIVO': fecha_archivo,
+                    'MOTIVO_MOVIMIENTO': motivo_actual,
+                    'AGENCIA': agencia
+                })
+
+    df_out = pd.DataFrame(registros)
+    if df_out.empty:
+        df_out = pd.DataFrame(columns=[
+            'FECHA_OPER','SUCURSAL','RECIBO','BULTOS','MONEDA','IMPORTE',
+            'ING_EGR','CLASIFICACION','FECHA_ARCHIVO','MOTIVO_MOVIMIENTO','AGENCIA'
+        ])
+        print(f'[EC_BULTOS_ATM] {filename}: No se detectaron registros válidos.')
+
+    df_out = _ordenar_y_renombrar_columnas_bultos(df_out)
+    df_out.to_excel(path_salida, index=False)
+    print(f'[EC_BULTOS_ATM] Guardado: {path_salida}')
+    return path_salida
+
+##########################################################
+### 1) EC_BULTOS_BCO: Estado Cuenta BULTOS BANCO (def) ###
+##########################################################
+
+def get_ec_bultos_bco(fecha_ejecucion: datetime,
+                       filename: str,
+                       dir_entrada: str,
+                       dir_consolidado: str,
+                       sheet_name=None) -> Optional[str]:
+    """
+    Procesa archivos 'EC_BULTOS_BCO*.xlsx' / 'EC_BULTOS_BANCO*.xlsx' en formato LONG:
+      FECHA, SUCURSAL, RECIBO, BULTOS, MONEDA(ISO), IMPORTE, ING_EGR, CLASIFICACION, FECHA_ARCHIVO, MOTIVO_MOVIMIENTO, AGENCIA
+    - Detecta moneda por nombre de hoja, encabezados o en línea (prioridad en ese orden).
+    - Clasificación por encabezado ('ESTADO DE CUENTA DE ...'), default conservador 'BULTO BCO'.
+    Devuelve ruta de salida o None si no hubo registros.
+    """
+    path_entrada = os.path.join(dir_entrada, filename)
+    p = Path(path_entrada)
+    stem_out = p.stem + '_PROCESADO'
+    path_salida = os.path.join(dir_consolidado, f'{stem_out}.xlsx')
+
+    # Cargar hojas (si sheet_name=None -> todas)
+    if sheet_name is None:
+        hojas = pd.read_excel(path_entrada, sheet_name=None, header=None, dtype=str)
+    elif isinstance(sheet_name, (list, tuple)):
+        hojas = pd.read_excel(path_entrada, sheet_name=list(sheet_name), header=None, dtype=str)
+    else:
+        df_one = pd.read_excel(path_entrada, sheet_name=sheet_name, header=None, dtype=str)
+        hojas = {sheet_name: df_one}
+
+    rx_fecha_linea = re.compile(r'^\s*(\d{1,2}/\d{1,2}/\d{4})\b')
+    rx_totales = re.compile(r'\b(TOTAL|SUBTOTAL)\b', re.IGNORECASE)
+    # Incluye símbolos: ₲, G$, US$, U$S, R$, €, $
+    rx_moneda = re.compile(r'(GUARAN[IÍ]ES|D[ÓO]LARES|EUROS?|REALES?|PESOS?|PYG|GS|G\$|₲|USD|US\$|U\$S|R\$|BRL|EUR|ARS|€|\$)',
+                           re.IGNORECASE)
+
+    mapa_clasif = {
+        'BANCO': 'BCO',
+        'ATM': 'ATM',
+        'BULTOS DE BANCO': 'BULTO BCO',
+        'BULTOS DE ATM': 'BULTO ATM',
+    }
+
+    registros: List[Dict[str, str]] = []
+
+    for nombre_hoja, df in hojas.items():
+        df = df.fillna('')
+
+        agencia = ''
+        fecha_archivo = ''
+        clasificacion = 'BULTO BCO'  # por defecto
+        ing_egr = ''                 # IN/OUT
+        motivo_actual = ''
+
+        # Moneda por defecto: por nombre de hoja; si no, asumimos PYG
+        moneda_actual = _normaliza_moneda_iso(nombre_hoja)
+
+        for _, row in df.iterrows():
+            parts_all = [str(x).strip() for x in row.values if str(x).strip()]
+            linea = ' '.join(parts_all)
+            if not linea:
+                continue
+
+            linea_up = _strip_accents(linea).upper()
+
+            # Agencia
+            if 'PROSEGUR PARAGUAY S.A.' in linea_up:
+                m = re.search(r'SUCURSAL:\s*([^)]+)\)', linea, flags=re.IGNORECASE)
+                if m:
+                    agencia = m.group(1).strip()
+                continue
+
+            # Clasificación + fecha de archivo
+            if 'ESTADO DE CUENTA DE' in linea_up:
+                m_tipo = re.search(r'ESTADO DE CUENTA DE\s+(.*?)\s+AL[:\s]', linea, flags=re.IGNORECASE)
+                if m_tipo:
+                    texto = m_tipo.group(1).strip()
+                    texto_norm = _strip_accents(texto).upper()
+                    clasificacion = mapa_clasif.get(texto_norm, texto.strip()) or clasificacion
+                m_f = re.search(r'AL[:\s]+(\d{1,2}/\d{1,2}/\d{4})', linea, flags=re.IGNORECASE)
+                if m_f:
+                    fecha_archivo = m_f.group(1)
+                # si aparece moneda en el encabezado, usarla
+                m_mon_enc = rx_moneda.search(linea)
+                if m_mon_enc:
+                    moneda_actual = _normaliza_moneda_iso(m_mon_enc.group(1))
+                continue
+
+            # Secciones IN/OUT
+            if linea_up == 'INGRESOS':
+                ing_egr = 'IN'; motivo_actual = ''; continue
+            if linea_up == 'EGRESOS':
+                ing_egr = 'OUT'; motivo_actual = ''; continue
+
+            # Fin del bloque útil
+            if 'INFORME DE PROCESOS' in linea_up:
+                break
+
+            # Saltar totales/subtotales
+            if rx_totales.search(linea):
+                continue
+
+            # Si vemos token de MONEDA fuera de detalle (sin fecha al inicio), actualizamos contexto
+            if rx_moneda.search(linea) and not rx_fecha_linea.match(linea):
+                moneda_actual = _normaliza_moneda_iso(rx_moneda.search(linea).group(1))
+                continue
+
+            # Encabezado de MOTIVO (línea no-fecha dentro de IN/OUT)
+            if ing_egr and not rx_fecha_linea.match(linea):
+                motivo_actual = linea.strip()
+                continue
+
+            # Detalle (empieza con fecha)
+            m_date = rx_fecha_linea.match(linea)
+            if ing_egr and motivo_actual and m_date:
+                parts = parts_all
+                if not parts:
+                    continue
+
+                fecha_oper = parts[0]
+
+                # Índice del recibo: primer número con >=6 dígitos
+                idx_rec = next(
+                    (i for i, p in enumerate(parts[1:], 1) if re.fullmatch(r'\d{6,}', _strip_accents(p))),
+                    None
+                )
+                if idx_rec is None:
+                    # muy conservador: si no hay recibo claro, no registramos
+                    continue
+
+                sucursal = ' '.join(parts[1:idx_rec]).strip()
+                recibo = parts[idx_rec]
+                bultos = parts[idx_rec + 1] if idx_rec + 1 < len(parts) else ''
+                importe = parts[idx_rec + 2] if idx_rec + 2 < len(parts) else ''
+
+                # Última chance: si en la misma línea aparece un token de moneda, usarlo
+                m_mon_inline = rx_moneda.search(linea)
+                if m_mon_inline:
+                    moneda_actual = _normaliza_moneda_iso(m_mon_inline.group(1))
+
+                registros.append({
+                    'FECHA': fecha_oper,           # renombrado directamente
+                    'SUCURSAL': sucursal,
+                    'RECIBO': recibo,
+                    'BULTOS': bultos,
+                    'MONEDA': moneda_actual or 'PYG',
+                    'IMPORTE': importe,
+                    'ING_EGR': ing_egr,
+                    'CLASIFICACION': clasificacion,
+                    'FECHA_ARCHIVO': fecha_archivo,
+                    'MOTIVO_MOVIMIENTO': motivo_actual,
+                    'AGENCIA': agencia
+                })
+
+    # DataFrame base
+    df_out = pd.DataFrame(registros, columns=[
+        'FECHA', 'SUCURSAL', 'RECIBO', 'BULTOS', 'MONEDA', 'IMPORTE',
+        'ING_EGR', 'CLASIFICACION', 'FECHA_ARCHIVO', 'MOTIVO_MOVIMIENTO', 'AGENCIA'
+    ])
+
+    if df_out.empty:
+        df_out = pd.DataFrame(columns=[
+            'FECHA', 'SUCURSAL', 'RECIBO', 'BULTOS', 'MONEDA', 'IMPORTE',
+            'ING_EGR', 'CLASIFICACION', 'FECHA_ARCHIVO', 'MOTIVO_MOVIMIENTO', 'AGENCIA'
+        ])
+        print(f'[EC_BULTOS_BCO] {filename}: No se detectaron registros válidos.')
+
+    # Orden final (re-usa helper de bultos para mantener consistencia)
+    df_out = _ordenar_y_renombrar_columnas_bultos(df_out)
+
+    # Guardar salida
+    df_out.to_excel(path_salida, index=False)
+    print(f'[EC_BULTOS_BCO] Guardado: {path_salida}')
+    return path_salida
+
+###########################################
+### 1) INV_ATM: INVENTARIO DE ATM (def) ###
+###########################################
+
+def get_inv_atm(fecha_ejecucion: datetime,
+                filename: str,
+                dir_entrada: str,
+                dir_consolidado: str,
+                include_zeros: bool = True) -> Optional[str]:
+    """
+    Procesa un archivo 'INV_BILLETES_ATM*.xls[x]' y genera un Excel procesado en dir_consolidado.
+    Columnas de salida:
+      FECHA_INVENTARIO, DIVISA, AGENCIA, AGRUPACION_EFECTIVO, TIPO_VALOR,
+      DENOMINACION, DEPOSITO, CJE_DEP, CANJE, MONEDA, IMPORTE_TOTAL
+    """
+    # ---- Config/tokens específicos de INV ATM ----
+    AGRUP_TOKENS = ["TESORO ATM", "FAJOS ATM", "PICOS ATM"]
+    TIPO_TOKENS  = ["BILLETES (LADRILLOS)", "BILLETES"]  # orden importa
+    FIN_MONEDA_UP = "TOTAL DE LA MONEDA"
+    STOP_ROW_TOKENS = {
+        "SUB TOTAL", "SUBTOTAL", "TOTAL DEL DEPÓSITO", "TOTAL DEL DEPOSITO",
+        "TOTAL DEPÓSITO", "TOTAL DEPOSITO"
+    }
+    DATE_RE    = re.compile(r"(\d{2}/\d{2}/\d{4})")
+    AGENCIA_RE = re.compile(r"SUCURSAL:\s*([^)]+)\)", re.IGNORECASE)
+    TITULO_RE  = re.compile(r"SALDO DE INVENTARIO DE BILLETES ATM AL", re.IGNORECASE)
+
+    def normaliza_divisa_code(code_upper: str) -> str:
+        """Deja DIVISA en códigos tipo 'PYG'/'USD' si se detecta, o devuelve el texto upper."""
+        up = (code_upper or "").upper()
+        if "USD" in up:
+            return "USD"
+        if "PYG" in up or "GUARANI" in _strip_accents(up):
+            return "PYG"
+        return up
+
+    # ---- Paths ----
+    path_entrada = os.path.join(dir_entrada, filename)
+    p = Path(path_entrada)
+    stem_out = p.stem + '_PROCESADO'
+    path_salida = os.path.join(dir_consolidado, f'{stem_out}.xlsx')
+
+    # ---- Helpers internos de INV ----
+    def extrae_agencia_y_fecha(df: pd.DataFrame) -> Dict[str, str]:
+        agencia, fecha = "", ""
+        for _, row in df.iterrows():
+            for cell in row:
+                t = _txt(cell)
+                if not agencia:
+                    m = AGENCIA_RE.search(t)
+                    if m:
+                        agencia = m.group(1).strip()
+                if not fecha and (TITULO_RE.search(t) or "SALDO DE INVENTARIO" in t.upper()):
+                    m = DATE_RE.search(t)
+                    if m:
+                        fecha = m.group(1)
+            if agencia and fecha:
+                break
+        if not fecha:
+            for _, row in df.iterrows():
+                for cell in row:
+                    m = DATE_RE.search(_txt(cell))
+                    if m:
+                        fecha = m.group(1)
+                        break
+                if fecha:
+                    break
+        return {"AGENCIA": agencia, "FECHA_INVENTARIO": fecha}
+
+    def capturar_codigo_total(row_text_upper: str) -> Optional[str]:
+        m = re.search(r"TOTAL\s+DE\s+LA\s+MONEDA\s+([A-Z]{3})", row_text_upper, flags=re.IGNORECASE)
+        return m.group(1).upper() if m else None
+
+    def buscar_fin_y_codigo(df: pd.DataFrame) -> Tuple[int, Optional[str]]:
+        row_end, code = len(df), None
+        for i, row in df.iterrows():
+            row_up = " | ".join(_upper(c) for c in row.tolist())
+            if FIN_MONEDA_UP in row_up:
+                row_end = i
+                code = capturar_codigo_total(row_up)
+                break
+        return row_end, code
+
+    def buscar_inicio_por_divisa(df: pd.DataFrame, row_end: int) -> Optional[int]:
+        for i, row in df.iterrows():
+            if i >= row_end:
+                break
+            ups = [_upper(c) for c in row.tolist() if _txt(c)]
+            if "USD" in ups or "PYG" in ups:
+                return i
+        return None
+
+    def buscar_inicio_fallback(df: pd.DataFrame, row_end: int) -> Optional[int]:
+        for i, row in df.iterrows():
+            if i >= row_end:
+                break
+            nums = [j for j, c in enumerate(row.tolist()) if _to_int(c) is not None]
+            if not nums:
+                continue
+            denom_col = nums[0]
+            left_up = " ".join(_upper(row.iloc[j]) for j in range(0, denom_col) if _txt(row.iloc[j]))
+            if any(tok in left_up for tok in AGRUP_TOKENS):
+                return i
+        return None
+
+    def localiza_bloque(df: pd.DataFrame) -> Dict[str, Any]:
+        row_end, code_total = buscar_fin_y_codigo(df)
+        row_start = buscar_inicio_por_divisa(df, row_end)
+        if row_start is None:
+            row_start = buscar_inicio_fallback(df, row_end)
+        if row_start is None:
+            raise ValueError("No se pudo determinar el inicio del bloque (no se encontró USD/PYG ni agrupación con denominación).")
+        return {"row_start": row_start, "row_end": row_end, "moneda_codigo": code_total}
+
+    def fila_es_total_o_subtotal(row) -> bool:
+        up = " ".join(_upper(c) for c in row.tolist())
+        return any(tok in up for tok in STOP_ROW_TOKENS) or FIN_MONEDA_UP in up
+
+    def lista_numeros_con_indices(row) -> List[Tuple[int, int]]:
+        out = []
+        for j, c in enumerate(row.tolist()):
+            v = _to_int(c)
+            if v is not None:
+                out.append((j, v))
+        return out
+
+    def siguiente_numero_a_la_derecha(row, desde_col: int) -> Tuple[int, int]:
+        ncols = len(row)
+        for j in range(desde_col + 1, ncols):
+            v = _to_int(row.iloc[j])
+            if v is not None:
+                return j, v
+        return ncols, 0
+
+    def detectar_agrup_y_tipo(left_cells: List[str]) -> Tuple[Optional[str], Optional[str]]:
+        left_up = " ".join(_upper(c) for c in left_cells if _txt(c))
+        tipo = None
+        for t in TIPO_TOKENS:
+            if t in left_up:
+                tipo = t
+                break
+        agrup = None
+        for a in AGRUP_TOKENS:
+            if a in left_up:
+                agrup = a
+                break
+        return agrup, tipo
+
+    def parsea_cuerpo(df: pd.DataFrame, row_start: int, row_end: int, default_code: Optional[str],
+                      agencia: str, fecha: str) -> List[Dict[str, Any]]:
+        registros: List[Dict[str, Any]] = []
+        cur_divisa = normaliza_divisa_code(default_code or "")
+        cur_agrup, cur_tipo = "", ""
+
+        for i in range(row_start, row_end):
+            row = df.iloc[i]
+            if fila_es_total_o_subtotal(row):
+                continue
+
+            ups = [_upper(c) for c in row.tolist() if _txt(c)]
+            if "USD" in ups:
+                cur_divisa = "USD"
+            elif "PYG" in ups:
+                cur_divisa = "PYG"
+
+            nums = lista_numeros_con_indices(row)
+            if not nums:
+                continue
+            denom_col, denom_val = nums[0]
+
+            left_cells = [row.iloc[j] for j in range(0, denom_col)]
+            agrup, tipo = detectar_agrup_y_tipo(left_cells)
+            if agrup:
+                cur_agrup = agrup
+            if tipo:
+                cur_tipo = tipo
+
+            # Tomar los 5 números siguientes (DEPOSITO,CJE_DEP,CANJE,MONEDA,IMPORTE_TOTAL)
+            idx = denom_col
+            vals = []
+            for _ in range(5):
+                idx, v = siguiente_numero_a_la_derecha(row, idx)
+                vals.append(v)
+            while len(vals) < 5:
+                vals.append(0)
+
+            reg = {
+                "FECHA_INVENTARIO": fecha,
+                "DIVISA": cur_divisa or "PYG",
+                "AGENCIA": agencia,
+                "AGRUPACION_EFECTIVO": cur_agrup,
+                "TIPO_VALOR": cur_tipo,
+                "DENOMINACION": denom_val,
+                "DEPOSITO": vals[0] or 0,
+                "CJE_DEP": vals[1] or 0,
+                "CANJE": vals[2] or 0,
+                "MONEDA": vals[3] or 0,
+                "IMPORTE_TOTAL": vals[4] or 0,
+            }
+            if include_zeros or any([reg["DEPOSITO"], reg["CJE_DEP"], reg["CANJE"], reg["MONEDA"], reg["IMPORTE_TOTAL"]]):
+                registros.append(reg)
+
+        return registros
+
+    # ---- Procesar el archivo (todas las hojas) ----
+    try:
+        xls = pd.ExcelFile(path_entrada, engine="openpyxl")
+    except Exception as e:
+        print(f"[INV_ATM] {filename}: No se pudo abrir el archivo ({e}).")
+        return None
+
+    registros: List[Dict[str, Any]] = []
+    for sheet in xls.sheet_names:
+        try:
+            df = pd.read_excel(path_entrada, sheet_name=sheet, header=None, dtype=object, engine="openpyxl").fillna("")
+            meta = extrae_agencia_y_fecha(df)
+            lim = localiza_bloque(df)
+            registros.extend(
+                parsea_cuerpo(df, lim["row_start"], lim["row_end"], lim.get("moneda_codigo"),
+                              meta.get("AGENCIA", ""), meta.get("FECHA_INVENTARIO", ""))
+            )
+        except Exception as e:
+            # si una hoja falla, continuamos con las demás
+            print(f"[INV_ATM] Hoja '{sheet}' omitida: {e}")
+            continue
+
+    if not registros:
+        print(f"[INV_ATM] {filename}: No se extrajeron filas.")
+        # guardo estructura vacía para mantener el flujo
+        cols = ["FECHA_INVENTARIO","DIVISA","AGENCIA","AGRUPACION_EFECTIVO","TIPO_VALOR",
+                "DENOMINACION","DEPOSITO","CJE_DEP","CANJE","MONEDA","IMPORTE_TOTAL"]
+        pd.DataFrame(columns=cols).to_excel(path_salida, index=False)
+        print(f'[INV_ATM] Guardado vacío: {path_salida}')
+        return path_salida
+
+    df_out = pd.DataFrame(registros)[[
+        "FECHA_INVENTARIO","DIVISA","AGENCIA",
+        "AGRUPACION_EFECTIVO","TIPO_VALOR",
+        "DENOMINACION","DEPOSITO","CJE_DEP","CANJE","MONEDA","IMPORTE_TOTAL"
+    ]]
+    df_out.sort_values(by=[
+        "FECHA_INVENTARIO","AGENCIA","DIVISA","AGRUPACION_EFECTIVO","TIPO_VALOR","DENOMINACION"
+    ], inplace=True)
+
+    # ---- Guardar ----
+    df_out.to_excel(path_salida, index=False)
+    print(f'[INV_ATM] Guardado: {path_salida}')
+    return path_salida
+
+#############################################
+### 1) INV_BCO: INVENTARIO DE BANCO (def) ###
+#############################################
+
+def get_inv_bco(fecha_ejecucion: datetime,
+                filename: str,
+                dir_entrada: str,
+                dir_consolidado: str,
+                include_zeros: bool = True) -> Optional[str]:
+    """
+    Procesa un archivo 'INV_BILLETES_BANCO*.xls[x]' y genera un Excel procesado en dir_consolidado.
+    Columnas de salida:
+      FECHA_INVENTARIO, DIVISA, AGENCIA, AGRUPACION_EFECTIVO, TIPO_VALOR,
+      DENOMINACION, DEPOSITO, CJE_DEP, CANJE, MONEDA, IMPORTE_TOTAL
+    """
+    # ---- Config/tokens específicos de INV BANCO ----
+    AGRUP_TOKENS = ["TESORO EFECTIVO", "FAJOS EFECTIVOS", "PICOS EFECTIVO"]
+    TIPO_TOKENS  = ["BILLETES (LADRILLOS)", "MONEDAS (BOLSAS)", "MONEDAS (PAQUETES)", "BILLETES", "MONEDAS"]
+    FIN_MONEDA_UP = "TOTAL DE LA MONEDA"
+    STOP_ROW_TOKENS = {
+        "SUB TOTAL", "SUBTOTAL", "TOTAL DEL DEPÓSITO", "TOTAL DEL DEPOSITO",
+        "TOTAL DEPÓSITO", "TOTAL DEPOSITO"
+    }
+    DATE_RE    = re.compile(r"(\d{2}/\d{2}/\d{4})")
+    TITULO_RE  = re.compile(r"SALDOS?\s+DE\s+INVENTARIO\s+DE\s+BILLETES\s+AL", re.IGNORECASE)
+    AGENCIA_RE = re.compile(r"SUCURSAL:\s*([^)]+)\)", re.IGNORECASE)
+
+    def normaliza_divisa_code(code_upper: str) -> str:
+        """Convierte 'PYG'->'GUARANIES', 'USD'->'DOLARES' para mantener texto como en tus inventarios."""
+        up = (code_upper or "").upper()
+        if "USD" in up:
+            return "DOLARES"
+        if "PYG" in up or "GUARANI" in _strip_accents(up):
+            return "GUARANIES"
+        return up
+
+    # ---- Paths ----
+    path_entrada = os.path.join(dir_entrada, filename)
+    p = Path(path_entrada)
+    stem_out = p.stem + '_PROCESADO'
+    path_salida = os.path.join(dir_consolidado, f'{stem_out}.xlsx')
+
+    # ---- Helpers internos de INV BANCO ----
+    def extrae_agencia_y_fecha(df: pd.DataFrame) -> Dict[str, str]:
+        agencia, fecha = "", ""
+        for _, row in df.iterrows():
+            for cell in row:
+                t = _txt(cell)
+                if not agencia:
+                    m = AGENCIA_RE.search(t)
+                    if m:
+                        agencia = m.group(1).strip()
+                if not fecha and (TITULO_RE.search(t) or "INVENTARIO" in t.upper()):
+                    m = DATE_RE.search(t)
+                    if m:
+                        fecha = m.group(1)
+            if agencia and fecha:
+                break
+        if not fecha:
+            for _, row in df.iterrows():
+                for cell in row:
+                    m = DATE_RE.search(_txt(cell))
+                    if m:
+                        fecha = m.group(1); break
+                if fecha: break
+        return {"AGENCIA": agencia, "FECHA_INVENTARIO": fecha}
+
+    def capturar_codigo_total(row_text_upper: str) -> Optional[str]:
+        m = re.search(r"TOTAL\s+DE\s+LA\s+MONEDA\s+([A-Z]{3})", row_text_upper, flags=re.IGNORECASE)
+        return m.group(1).upper() if m else None
+
+    def buscar_fin_y_codigo(df: pd.DataFrame) -> Tuple[int, Optional[str]]:
+        row_end, code = len(df), None
+        for i, row in df.iterrows():
+            row_up = " | ".join(_upper(c) for c in row.tolist())
+            if FIN_MONEDA_UP in row_up:
+                row_end = i
+                code = capturar_codigo_total(row_up)
+                break
+        return row_end, code
+
+    def buscar_inicio_por_divisa(df: pd.DataFrame, row_end: int) -> Optional[int]:
+        for i, row in df.iterrows():
+            if i >= row_end: break
+            ups = [_upper(c) for c in row.tolist() if _txt(c)]
+            if "USD" in ups or "PYG" in ups:
+                return i
+        return None
+
+    def buscar_inicio_por_cabecera(df: pd.DataFrame, row_end: int) -> Optional[int]:
+        for i, row in df.iterrows():
+            row_up = " | ".join(_upper(c) for c in row.tolist())
+            if ("DIVISA" in row_up and "DENOM" in row_up and "CJE/DEP" in row_up and "IMPORTE" in row_up):
+                return i + 1
+        return None
+
+    def buscar_inicio_fallback(df: pd.DataFrame, row_end: int) -> Optional[int]:
+        for i, row in df.iterrows():
+            if i >= row_end: break
+            nums = [j for j, c in enumerate(row.tolist()) if _to_int(c) is not None]
+            if not nums: continue
+            denom_col = nums[0]
+            left_up = " ".join(_upper(row.iloc[j]) for j in range(0, denom_col) if _txt(row.iloc[j]))
+            if any(tok in left_up for tok in AGRUP_TOKENS):
+                return i
+        return None
+
+    def localiza_bloque(df: pd.DataFrame) -> Dict[str, Any]:
+        row_end, code_total = buscar_fin_y_codigo(df)
+        row_start = buscar_inicio_por_cabecera(df, row_end)
+        if row_start is None:
+            row_start = buscar_inicio_por_divisa(df, row_end)
+        if row_start is None:
+            row_start = buscar_inicio_fallback(df, row_end)
+        if row_start is None:
+            raise ValueError("No se pudo determinar el inicio del bloque (cabecera / USD-PYG / agrupación+denominación).")
+        return {"row_start": row_start, "row_end": row_end, "moneda_codigo": code_total}
+
+    def fila_es_total_o_subtotal(row) -> bool:
+        up = " ".join(_upper(c) for c in row.tolist())
+        return any(tok in up for tok in STOP_ROW_TOKENS) or FIN_MONEDA_UP in up
+
+    def lista_numeros_con_indices(row) -> List[Tuple[int, int]]:
+        out = []
+        for j, c in enumerate(row.tolist()):
+            v = _to_int(c)
+            if v is not None:
+                out.append((j, v))
+        return out
+
+    def siguiente_numero_a_la_derecha(row, desde_col: int) -> Tuple[int, int]:
+        ncols = len(row)
+        for j in range(desde_col + 1, ncols):
+            v = _to_int(row.iloc[j])
+            if v is not None:
+                return j, v
+        return ncols, 0
+
+    def detectar_agrup_y_tipo(left_cells: List[str]) -> Tuple[Optional[str], Optional[str]]:
+        left_up = " ".join(_upper(c) for c in left_cells if _txt(c))
+        tipo = None
+        for t in TIPO_TOKENS:
+            if t in left_up:
+                tipo = t; break
+        agrup = None
+        for a in AGRUP_TOKENS:
+            if a in left_up:
+                agrup = a; break
+        return agrup, tipo
+
+    def parsea_cuerpo(df: pd.DataFrame, row_start: int, row_end: int, default_code: Optional[str],
+                      agencia: str, fecha: str) -> List[Dict[str, Any]]:
+        registros: List[Dict[str, Any]] = []
+        cur_divisa = normaliza_divisa_code(default_code or "")
+        cur_agrup, cur_tipo = "", ""
+
+        for i in range(row_start, row_end):
+            row = df.iloc[i]
+            if fila_es_total_o_subtotal(row):
+                continue
+
+            ups = [_upper(c) for c in row.tolist() if _txt(c)]
+            if "USD" in ups:
+                cur_divisa = normaliza_divisa_code("USD")
+            elif "PYG" in ups:
+                cur_divisa = normaliza_divisa_code("PYG")
+
+            nums = lista_numeros_con_indices(row)
+            if not nums:
+                continue
+            denom_col, denom_val = nums[0]
+
+            left_cells = [row.iloc[j] for j in range(0, denom_col)]
+            agrup, tipo = detectar_agrup_y_tipo(left_cells)
+            if agrup: cur_agrup = agrup
+            if tipo:  cur_tipo = tipo
+
+            # Después de DENOM vienen 5 números: DEPOSITO, CJE_DEP, CANJE, MONEDA, IMPORTE_TOTAL
+            idx = denom_col
+            vals = []
+            for _ in range(5):
+                idx, v = siguiente_numero_a_la_derecha(row, idx)
+                vals.append(v)
+            while len(vals) < 5:
+                vals.append(0)
+
+            reg = {
+                "FECHA_INVENTARIO": fecha,
+                "DIVISA": cur_divisa or "GUARANIES",
+                "AGENCIA": agencia,
+                "AGRUPACION_EFECTIVO": cur_agrup,
+                "TIPO_VALOR": cur_tipo,
+                "DENOMINACION": denom_val,
+                "DEPOSITO": vals[0] or 0,
+                "CJE_DEP": vals[1] or 0,
+                "CANJE": vals[2] or 0,
+                "MONEDA": vals[3] or 0,
+                "IMPORTE_TOTAL": vals[4] or 0,
+            }
+            if include_zeros or any([reg["DEPOSITO"], reg["CJE_DEP"], reg["CANJE"], reg["MONEDA"], reg["IMPORTE_TOTAL"]]):
+                registros.append(reg)
+
+        return registros
+
+    # ---- Procesar el archivo (todas las hojas) ----
+    try:
+        xls = pd.ExcelFile(path_entrada, engine="openpyxl")
+    except Exception as e:
+        print(f"[INV_BCO] {filename}: No se pudo abrir el archivo ({e}).")
+        return None
+
+    registros: List[Dict[str, Any]] = []
+    for sheet in xls.sheet_names:
+        try:
+            df = pd.read_excel(path_entrada, sheet_name=sheet, header=None, dtype=object, engine="openpyxl").fillna("")
+            meta = extrae_agencia_y_fecha(df)
+            lim = localiza_bloque(df)
+            registros.extend(
+                parsea_cuerpo(df, lim["row_start"], lim["row_end"], lim.get("moneda_codigo"),
+                              meta.get("AGENCIA", ""), meta.get("FECHA_INVENTARIO", ""))
+            )
+        except Exception as e:
+            print(f"[INV_BCO] Hoja '{sheet}' omitida: {e}")
+            continue
+
+    # ---- Salida ----
+    cols = ["FECHA_INVENTARIO","DIVISA","AGENCIA","AGRUPACION_EFECTIVO","TIPO_VALOR",
+            "DENOMINACION","DEPOSITO","CJE_DEP","CANJE","MONEDA","IMPORTE_TOTAL"]
+
+    if not registros:
+        print(f"[INV_BCO] {filename}: No se extrajeron filas.")
+        pd.DataFrame(columns=cols).to_excel(path_salida, index=False)
+        print(f'[INV_BCO] Guardado vacío: {path_salida}')
+        return path_salida
+
+    df_out = pd.DataFrame(registros)[cols]
+    df_out.sort_values(by=[
+        "FECHA_INVENTARIO","AGENCIA","DIVISA","AGRUPACION_EFECTIVO","TIPO_VALOR","DENOMINACION"
+    ], inplace=True)
+
+    df_out.to_excel(path_salida, index=False)
+    print(f'[INV_BCO] Guardado: {path_salida}')
+    return path_salida
+
+
+#########################
+### DESPACHADOR / MAIN ###
+#########################
+
+def _dispatch_and_process(fecha_ejecucion: datetime, filename: str) -> None:
+    """Detecta tipo por prefijo de nombre y ejecuta el parser correspondiente."""
+    fname_upper = filename.upper()
+
+    try:
+        if fname_upper.startswith('EC_ATM'):
+            get_ec_atm(fecha_ejecucion, filename, FULL_PATH, FULL_PATH_CONSOLIDADO)
+        elif fname_upper.startswith('EC_BANCO') or fname_upper.startswith('EC_BCO'):
+            get_ec_banco(fecha_ejecucion, filename, FULL_PATH, FULL_PATH_CONSOLIDADO)
+        elif fname_upper.startswith('EC_BULTOS_ATM'):
+            get_ec_bultos_atm(fecha_ejecucion, filename, FULL_PATH, FULL_PATH_CONSOLIDADO)
+        elif fname_upper.startswith('EC_BULTOS_BCO') or fname_upper.startswith('EC_BULTOS_BANCO'):
+            get_ec_bultos_bco(fecha_ejecucion, filename, FULL_PATH, FULL_PATH_CONSOLIDADO)
+        elif fname_upper.startswith('INV_ATM'):
+            get_inv_atm(fecha_ejecucion, filename, FULL_PATH, FULL_PATH_CONSOLIDADO)
+        elif fname_upper.startswith('INV_BCO') or fname_upper.startswith('INV_BANCO'):
+            get_inv_bco(fecha_ejecucion, filename, FULL_PATH, FULL_PATH_CONSOLIDADO)
+        else:
+            print(f'[SKIP] No se reconoce tipo para: {filename}')
+            return
+
+        # Si llegó hasta aquí sin excepción, mover a PROCESADO
+        src = os.path.join(FULL_PATH, filename)
+        dst = os.path.join(FULL_PATH_PROCESADO, filename)
+        shutil.move(src, dst)
+        print(f'[MOVE] {filename} -> {FULL_PATH_PROCESADO}')
+
+    except Exception as e:
+        print(f'[ERROR] Procesando {filename}: {e}')
+
+
+if __name__ == '__main__':
+    fecha_ejecucion = pd.to_datetime(datetime.now()).date()
+    print('=' * 30)
+    print(f'Inicio: {fecha_ejecucion}')
+
+    archivos = [f for f in os.listdir(FULL_PATH) if os.path.isfile(os.path.join(FULL_PATH, f))]
+    if not archivos:
+        print('[INFO] No hay archivos en PENDIENTES.')
+    else:
+        for fname in archivos:
+            print(f'Procesando: {fname}')
+            _dispatch_and_process(fecha_ejecucion, fname)
+
+    print('Fin de ejecución.')
+    print('=' * 30)
