@@ -1,0 +1,1020 @@
+# -*- coding: utf-8 -*-
+"""
+CONSOLIDADO PROSEGUR – UNIFICADO (EC_*, BULTOS_* y SALDOS ANTERIORES)
+-------------------------------------------------------------------------------
+- Estructura de carpetas estilo BRITIMP:
+    PROSEGUR/
+        ASU, CDE, CNC, ENC, OVD  -> pendientes
+        PROCESADO/AAAA-MM-DD/AGENCIA/ -> procesados
+        CONSOLIDADO/ (reservado)
+        PROSEGUR_log.txt -> log
+
+- Tipos soportados por ahora (por nombre de archivo):
+    EC_ATM*              -> get_ec_atm
+    EC_BANCO* / EC_BCO*  -> get_ec_banco
+    EC_BULTOS_ATM*       -> get_ec_bultos_atm
+    EC_BULTOS_BCO*       -> get_ec_bultos_bco / EC_BULTOS_BANCO*
+    INV*ATM*             -> get_inv_atm  (usa INV ATM.py)
+    INV*BANCO* / INV*BCO*-> get_inv_bco  (usa INV BCO.py)
+
+- Saldos anteriores:
+    * EC_ATM:
+        fila "Saldo Anterior" -> [USD, PYG] → SALDO_ANTERIOR_USD, SALDO_ANTERIOR_PYG
+    * EC_BANCO:
+        fila "Saldo Anterior" por hoja/moneda → SALDO_ANTERIOR
+    * EC_BULTOS_ATM:
+        fila "Saldo Anterior" -> [cant_pyg, saldo_pyg, cant_usd, saldo_usd]
+        → SALDO_ANTERIOR_PYG, SALDO_ANTERIOR_USD
+    * EC_BULTOS_BCO:
+        fila "Saldo Anterior" -> [cant, saldo] → SALDO_ANTERIOR
+"""
+
+import os
+import re
+import shutil
+import unicodedata
+from datetime import datetime
+from pathlib import Path
+from typing import Optional, Union, List, Dict, Tuple, Any
+
+import pandas as pd
+from loguru import logger
+import sys
+import importlib.util
+
+
+# ==============================
+#  ESTRUCTURA DE CARPETAS
+# ==============================
+
+AGENCIES = ['ASU', 'CDE', 'CNC', 'ENC', 'OVD']
+
+
+def resolve_root_prosegur() -> Path:
+    here = Path(__file__).resolve().parent if "__file__" in globals() else Path.cwd()
+    root = here / 'PROSEGUR'
+    return root
+
+
+ROOT = resolve_root_prosegur()
+PENDIENTES = ROOT
+PROCESADO = ROOT / 'PROCESADO'
+CONSOLIDADO = ROOT / 'CONSOLIDADO'
+LOG_PATH = ROOT / 'PROSEGUR_log.txt'
+
+# Configurar logger
+logger.remove()
+logger.add(sys.stdout, level="INFO", format="{time:YYYY-MM-DD HH:mm:ss} | {level} | {message}")
+logger.add(str(LOG_PATH), level="INFO", rotation="1 week", retention="4 weeks",
+           format="{time:YYYY-MM-DD HH:mm:ss} | {level} | {message}")
+
+logger.info(f"ROOT = {ROOT}")
+
+
+# ==============================
+#  HELPERS GENERALES
+# ==============================
+
+def _strip_accents(s: str) -> str:
+    return ''.join(c for c in unicodedata.normalize('NFD', s) if unicodedata.category(c) != 'Mn')
+
+
+def _first_non_empty_after(row_vals: List[str], start_idx: int) -> Optional[int]:
+    if start_idx is None:
+        return None
+    for idx in range(start_idx + 1, len(row_vals)):
+        if str(row_vals[idx]).strip() != '':
+            return idx
+    return None
+
+
+def _get_cell(row_vals: List[str], idx: Optional[int], default: str = '') -> str:
+    if idx is None or idx >= len(row_vals):
+        return default
+    v = str(row_vals[idx]).strip()
+    return v if v != '' else default
+
+
+def _only_digits(s: str) -> str:
+    return ''.join(ch for ch in str(s) if ch.isdigit())
+
+
+def _normaliza_moneda(token: str) -> str:
+    """Normaliza a: GUARANIES, DOLARES, EUROS, REALES, PESOS."""
+    t = _strip_accents(token).upper()
+    if 'GUARANI' in t:
+        return 'GUARANIES'
+    if 'DOLARE' in t or 'DOLLAR' in t:
+        return 'DOLARES'
+    if 'EURO' in t:
+        return 'EUROS'
+    if 'REAL' in t:
+        return 'REALES'
+    if 'PESO' in t:
+        return 'PESOS'
+    return token.strip()
+
+
+def _normaliza_moneda_iso(token: str) -> str:
+    """Convierte a códigos ISO (PYG, USD, EUR, BRL, ARS)."""
+    t = _strip_accents(token).upper()
+    if 'GUARANI' in t:
+        return 'PYG'
+    if 'DOLARE' in t or 'DOLLAR' in t or 'USD' in t:
+        return 'USD'
+    if 'EURO' in t:
+        return 'EUR'
+    if 'REAL' in t or 'REALES' in t:
+        return 'BRL'
+    if 'PESO' in t or 'ARG' in t:
+        return 'ARS'
+    return t
+
+
+def get_agencia(nombre_archivo: str, default: str = '') -> str:
+    """
+    Intenta inferir la agencia desde el nombre de archivo.
+    Ej: "ASU_EC_ATM_..." -> "ASU"
+    """
+    fname_up = nombre_archivo.upper()
+    for ag in AGENCIES:
+        if fname_up.startswith(ag + '_') or f'_{ag}_' in fname_up:
+            return ag
+    return default
+
+
+def get_procesado_dir(fecha: datetime, agencia: str) -> Path:
+    d = PROCESADO / fecha.strftime('%Y-%m-%d') / agencia
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def move_original(path_in: Path, dest_dir: Path) -> Path:
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    dest_path = dest_dir / path_in.name
+    shutil.move(str(path_in), str(dest_path))
+    return dest_path
+
+
+def _leer_hojas_general(path_entrada: str,
+                        sheet_name: Union[None, int, str, List[Union[int, str]]]):
+    """
+    Devuelve un dict {nombre_hoja: DataFrame} según el parámetro.
+    None -> todas las hojas
+    int/str -> una sola hoja
+    lista -> solo esas hojas
+    """
+    if sheet_name is None:
+        return pd.read_excel(path_entrada, sheet_name=None, header=None, dtype=str)
+    if isinstance(sheet_name, (list, tuple)):
+        return pd.read_excel(path_entrada, sheet_name=list(sheet_name), header=None, dtype=str)
+    df = pd.read_excel(path_entrada, sheet_name=sheet_name, header=None, dtype=str)
+    return {sheet_name: df}
+
+
+# ==============================
+#  FORMATOS DE SALIDA
+# ==============================
+
+def _ordenar_y_renombrar_columnas_ec(df: pd.DataFrame) -> pd.DataFrame:
+    df.columns = [str(c).replace(' ', '_').upper() for c in df.columns]
+    df = df.rename(columns={'FECHA_OPER': 'FECHA', 'MOTIVO MOVIMIENTO': 'MOTIVO_MOVIMIENTO'})
+    orden_final = [
+        'FECHA', 'SUCURSAL', 'RECIBO', 'ING_EGR', 'CLASIFICACION',
+        'MOTIVO_MOVIMIENTO', 'FECHA_ARCHIVO', 'AGENCIA', 'SALDO_ANTERIOR',
+        'BULTOS', 'MONEDA', 'MONTO'
+    ]
+    for col in orden_final:
+        if col not in df.columns:
+            df[col] = ''
+    return df[orden_final]
+
+
+# ==============================
+#  EC_ATM (Efectivo ATM)
+# ==============================
+
+def get_ec_atm(fecha_ejecucion: datetime,
+               filename: str,
+               dir_entrada: str,
+               dir_consolidado: str,
+               agencia_carpeta: Optional[str] = None) -> Optional[str]:
+    """
+    Parser para EC_ATM (usa lógica similar al script EC ATM.py adaptado a este unificado).
+    - Detecta fila de SALDO ANTERIOR (USD, PYG) y propaga a todas las filas.
+    """
+    path_entrada = os.path.join(dir_entrada, filename)
+    p = Path(path_entrada)
+    stem_out = p.stem + '_PROCESADO'
+    out_dir = dir_consolidado
+    Path(out_dir).mkdir(parents=True, exist_ok=True)
+    path_salida = os.path.join(out_dir, f'{stem_out}.xlsx')
+
+    try:
+        xls = pd.ExcelFile(path_entrada)
+    except Exception as e:
+        logger.info(f'[EC_ATM] {filename}: no se pudo abrir Excel: {e}')
+        return None
+
+    registros = []
+
+    for sheet_name in xls.sheet_names:
+        try:
+            df = pd.read_excel(xls, sheet_name=sheet_name, header=None, dtype=str)
+        except Exception:
+            continue
+
+        # Buscar SALDO ANTERIOR (monedas)
+        saldo_ant_pyg, saldo_ant_usd = '', ''
+        for _, row in df.iterrows():
+            linea = ' '.join(str(c) for c in row.tolist() if str(c).strip() != '')
+            up = _strip_accents(linea).upper()
+            if 'SALDO ANTERIOR' in up:
+                # asumimos formato: ... SALDO ANTERIOR ... USD ... PYG ...
+                nums = re.findall(r'[-]?\d[\d\.,]*', linea)
+                if len(nums) == 1:
+                    saldo_ant_pyg = nums[0]
+                elif len(nums) >= 2:
+                    saldo_ant_usd, saldo_ant_pyg = nums[0], nums[1]
+                break
+
+        # Buscar fecha de archivo
+        fecha_archivo = ''
+        for _, row in df.iterrows():
+            for c in row.tolist():
+                m = re.search(r'\b(\d{1,2}/\d{1,2}/\d{4})\b', str(c))
+                if m:
+                    fecha_archivo = m.group(1)
+                    break
+            if fecha_archivo:
+                break
+
+        # Parse movimientos (muy similar a EC ATM original)
+        rx_fecha_linea = re.compile(r'^\s*(\d{1,2}/\d{1,2}/\d{4})\b')
+        rx_totales = re.compile(r'\b(TOTAL|SUBTOTAL)\b', re.IGNORECASE)
+        rx_moneda = re.compile(r'\b(GUARAN[IÍ]ES|D[ÓO]LARES|EUROS?|REALES?|PESOS?)\b', re.IGNORECASE)
+
+        agencia = ''
+        ing_egr = ''
+        clasificacion = 'ATM'
+        moneda_actual = None
+
+        for _, row in df.iterrows():
+            linea = ' '.join(str(c) for c in row.tolist() if str(c).strip() != '')
+            linea_up = _strip_accents(linea).upper()
+
+            if not linea_up:
+                continue
+
+            # Agencia
+            if 'PROSEGUR PARAGUAY S.A.' in linea_up:
+                m = re.search(r'SUCURSAL:\s*([^)]+)\)', linea, flags=re.IGNORECASE)
+                if m:
+                    agencia = m.group(1).strip()
+                continue
+
+            # Tipo ING/EGR
+            if 'INGRESO' in linea_up:
+                ing_egr = 'INGRESO'
+            elif 'EGRESO' in linea_up:
+                ing_egr = 'EGRESO'
+
+            # Moneda
+            m_mon = rx_moneda.search(linea)
+            if m_mon:
+                moneda_actual = _normaliza_moneda(m_mon.group(1))
+
+            # Totales -> no considerar como movimiento
+            if rx_totales.search(linea):
+                continue
+
+            # Detectar filas de movimiento por fecha al inicio
+            m_fecha = rx_fecha_linea.match(linea)
+            if not m_fecha:
+                continue
+
+            partes = linea.split()
+            if not partes:
+                continue
+
+            fecha_oper = partes[0]
+            # recibo = primer token con al menos 6 dígitos
+            idx_rec = next(
+                (i for i, p in enumerate(partes[1:], 1) if re.fullmatch(r'\d{6,}', p)),
+                None
+            )
+            if idx_rec is None:
+                continue
+
+            sucursal = ' '.join(partes[1:idx_rec]).strip()
+            recibo = partes[idx_rec]
+            # último número lo tomamos como monto
+            nums = re.findall(r'[-]?\d[\d\.,]*', linea)
+            monto = nums[-1] if nums else ''
+
+            registros.append({
+                'FECHA': fecha_oper,
+                'SUCURSAL': sucursal,
+                'RECIBO': recibo,
+                'ING_EGR': ing_egr,
+                'CLASIFICACION': clasificacion,
+                'MOTIVO_MOVIMIENTO': '',
+                'FECHA_ARCHIVO': fecha_archivo,
+                'AGENCIA': agencia or (agencia_carpeta or ''),
+                'SALDO_ANTERIOR_USD': saldo_ant_usd,
+                'SALDO_ANTERIOR_PYG': saldo_ant_pyg,
+                'BULTOS': '',
+                'MONEDA': moneda_actual or '',
+                'MONTO': monto,
+            })
+
+    if not registros:
+        logger.info(f'[EC_ATM] {filename}: no se detectaron registros válidos.')
+        df_out = pd.DataFrame(columns=[
+            'FECHA', 'SUCURSAL', 'RECIBO', 'ING_EGR', 'CLASIFICACION',
+            'MOTIVO_MOVIMIENTO', 'FECHA_ARCHIVO', 'AGENCIA',
+            'SALDO_ANTERIOR_USD', 'SALDO_ANTERIOR_PYG',
+            'BULTOS', 'MONEDA', 'MONTO'
+        ])
+    else:
+        df_out = pd.DataFrame(registros)
+
+    df_out.to_excel(path_salida, index=False)
+    logger.info(f'[EC_ATM] {filename}: {len(df_out)} filas exportadas a {path_salida}')
+    return path_salida
+
+
+# ==============================
+#  EC_BANCO (Efectivo BANCO)
+# ==============================
+
+def get_ec_banco(fecha_ejecucion: datetime,
+                 filename: str,
+                 dir_entrada: str,
+                 dir_consolidado: str,
+                 agencia_carpeta: Optional[str] = None) -> Optional[str]:
+    """
+    Parser para EC_BANCO, incorporando SALDO_ANTERIOR por hoja/moneda.
+    """
+    path_entrada = os.path.join(dir_entrada, filename)
+    p = Path(path_entrada)
+    stem_out = p.stem + '_PROCESADO'
+    out_dir = dir_consolidado
+    Path(out_dir).mkdir(parents=True, exist_ok=True)
+    path_salida = os.path.join(out_dir, f'{stem_out}.xlsx')
+
+    try:
+        hojas = _leer_hojas_general(path_entrada, None)
+    except Exception as e:
+        logger.info(f'[EC_BANCO] {filename}: no se pudo leer Excel: {e}')
+        return None
+
+    registros: List[Dict[str, Any]] = []
+
+    rx_fecha_linea = re.compile(r'^\s*(\d{1,2}/\d{1,2}/\d{4})\b')
+    rx_totales = re.compile(r'\b(TOTAL|SUBTOTAL)\b', re.IGNORECASE)
+    rx_moneda = re.compile(r'\b(GUARAN[IÍ]ES|D[ÓO]LARES|EUROS?|REALES?|PESOS?)\b', re.IGNORECASE)
+
+    mapa_clasif = {
+        'BANCO': 'BCO',
+        'ATM': 'ATM',
+    }
+
+    for sheet_name, df in hojas.items():
+        agencia = ''
+        fecha_archivo = ''
+        clasificacion = 'BCO'
+        moneda_actual = None
+        saldo_anterior_por_moneda: Dict[str, str] = {}
+
+        # Buscar agencia y fecha de archivo
+        for _, row in df.iterrows():
+            linea = ' '.join(str(c) for c in row.tolist() if str(c).strip())
+            linea_up = _strip_accents(linea).upper()
+            if 'PROSEGUR PARAGUAY S.A.' in linea_up:
+                m = re.search(r'SUCURSAL:\s*([^)]+)\)', linea, flags=re.IGNORECASE)
+                if m:
+                    agencia = m.group(1).strip()
+            if 'ESTADO DE CUENTA DE' in linea_up:
+                m_tipo = re.search(r'ESTADO DE CUENTA DE\s+(.*?)\s+AL:', linea, flags=re.IGNORECASE)
+                if m_tipo:
+                    texto = m_tipo.group(1).strip()
+                    texto_norm = _strip_accents(texto).upper()
+                    clasificacion = mapa_clasif.get(texto_norm, texto.strip())
+                m_f = re.search(r'AL:\s*(\d{1,2}/\d{1,2}/\d{4})', linea, flags=re.IGNORECASE)
+                if m_f:
+                    fecha_archivo = m_f.group(1).strip()
+
+        # Buscar SALDO ANTERIOR por moneda
+        for _, row in df.iterrows():
+            linea = ' '.join(str(c) for c in row.tolist() if str(c).strip())
+            up = _strip_accents(linea).upper()
+            if 'SALDO ANTERIOR' in up:
+                m_mon = rx_moneda.search(linea)
+                if m_mon:
+                    mon = _normaliza_moneda(m_mon.group(1))
+                else:
+                    mon = 'DESCONOCIDA'
+                nums = re.findall(r'[-]?\d[\d\.,]*', linea)
+                saldo_val = nums[-1] if nums else ''
+                saldo_anterior_por_moneda[mon] = saldo_val
+
+        # Parse movimientos
+        for _, row in df.iterrows():
+            linea = ' '.join(str(c) for c in row.tolist() if str(c).strip())
+            linea_up = _strip_accents(linea).upper()
+
+            if not linea_up:
+                continue
+
+            # Moneda
+            m_mon = rx_moneda.search(linea)
+            if m_mon:
+                moneda_actual = _normaliza_moneda(m_mon.group(1))
+
+            # Totales
+            if rx_totales.search(linea):
+                continue
+
+            # Movimiento por fecha
+            m_fecha = rx_fecha_linea.match(linea)
+            if not m_fecha:
+                continue
+
+            partes = linea.split()
+            if not partes:
+                continue
+
+            fecha_oper = partes[0]
+            idx_rec = next(
+                (i for i, p in enumerate(partes[1:], 1) if re.fullmatch(r'\d{6,}', p)),
+                None
+            )
+            if idx_rec is None:
+                continue
+
+            sucursal = ' '.join(partes[1:idx_rec]).strip()
+            recibo = partes[idx_rec]
+            nums = re.findall(r'[-]?\d[\d\.,]*', linea)
+            monto = nums[-1] if nums else ''
+            saldo_ant = saldo_anterior_por_moneda.get(moneda_actual or '', '')
+
+            registros.append({
+                'FECHA': fecha_oper,
+                'SUCURSAL': sucursal,
+                'RECIBO': recibo,
+                'ING_EGR': '',
+                'CLASIFICACION': clasificacion,
+                'MOTIVO_MOVIMIENTO': '',
+                'FECHA_ARCHIVO': fecha_archivo,
+                'AGENCIA': agencia or (agencia_carpeta or ''),
+                'SALDO_ANTERIOR': saldo_ant,
+                'BULTOS': '',
+                'MONEDA': moneda_actual or '',
+                'MONTO': monto,
+            })
+
+    if not registros:
+        logger.info(f'[EC_BANCO] {filename}: no se detectaron registros válidos.')
+        df_out = pd.DataFrame(columns=[
+            'FECHA', 'SUCURSAL', 'RECIBO', 'ING_EGR', 'CLASIFICACION',
+            'MOTIVO_MOVIMIENTO', 'FECHA_ARCHIVO', 'AGENCIA',
+            'SALDO_ANTERIOR', 'BULTOS', 'MONEDA', 'MONTO'
+        ])
+    else:
+        df_out = pd.DataFrame(registros)
+
+    df_out.to_excel(path_salida, index=False)
+    logger.info(f'[EC_BANCO] {filename}: {len(df_out)} filas exportadas a {path_salida}')
+    return path_salida
+
+
+# ==============================
+#  EC_BULTOS_ATM
+# ==============================
+
+def get_ec_bultos_atm(fecha_ejecucion: datetime,
+                      filename: str,
+                      dir_entrada: str,
+                      dir_consolidado: str,
+                      agencia_carpeta: Optional[str] = None) -> Optional[str]:
+    """
+    Parser EC_BULTOS_ATM, con SALDO_ANTERIOR_PYG / SALDO_ANTERIOR_USD.
+    """
+    path_entrada = os.path.join(dir_entrada, filename)
+    p = Path(path_entrada)
+    stem_out = p.stem + '_PROCESADO'
+    out_dir = dir_consolidado
+    Path(out_dir).mkdir(parents=True, exist_ok=True)
+    path_salida = os.path.join(out_dir, f'{stem_out}.xlsx')
+
+    try:
+        hojas = _leer_hojas_general(path_entrada, None)
+    except Exception as e:
+        logger.info(f'[EC_BULTOS_ATM] {filename}: no se pudo leer Excel: {e}')
+        return None
+
+    registros: List[Dict[str, Any]] = []
+
+    rx_fecha_linea = re.compile(r'^\s*(\d{1,2}/\d{1,2}/\d{4})\b')
+    rx_totales = re.compile(r'\b(TOTAL|SUBTOTAL)\b', re.IGNORECASE)
+    rx_moneda = re.compile(r'\b(GUARAN[IÍ]ES|D[ÓO]LARES|EUROS?|REALES?|PESOS?)\b', re.IGNORECASE)
+
+    for sheet_name, df in hojas.items():
+        agencia = ''
+        fecha_archivo = ''
+        moneda_actual = None
+        saldo_ant_pyg, saldo_ant_usd = '', ''
+
+        # Agencia / fecha archivo
+        for _, row in df.iterrows():
+            linea = ' '.join(str(c) for c in row.tolist() if str(c).strip())
+            linea_up = _strip_accents(linea).upper()
+            if 'PROSEGUR PARAGUAY S.A.' in linea_up:
+                m = re.search(r'SUCURSAL:\s*([^)]+)\)', linea, flags=re.IGNORECASE)
+                if m:
+                    agencia = m.group(1).strip()
+            if 'BULTOS ATM' in linea_up and 'AL:' in linea_up:
+                m_f = re.search(r'AL:\s*(\d{1,2}/\d{1,2}/\d{4})', linea, flags=re.IGNORECASE)
+                if m_f:
+                    fecha_archivo = m_f.group(1).strip()
+
+        # SALDO ANTERIOR
+        for _, row in df.iterrows():
+            linea = ' '.join(str(c) for c in row.tolist() if str(c).strip())
+            up = _strip_accents(linea).upper()
+            if 'SALDO ANTERIOR' in up:
+                nums = re.findall(r'[-]?\d[\d\.,]*', linea)
+                # asumimos PYG, USD
+                if len(nums) == 1:
+                    saldo_ant_pyg = nums[0]
+                elif len(nums) >= 2:
+                    saldo_ant_pyg, saldo_ant_usd = nums[0], nums[1]
+
+        for _, row in df.iterrows():
+            linea = ' '.join(str(c) for c in row.tolist() if str(c).strip())
+            linea_up = _strip_accents(linea).upper()
+
+            if not linea_up:
+                continue
+
+            # Moneda
+            m_mon = rx_moneda.search(linea)
+            if m_mon:
+                moneda_actual = _normaliza_moneda(m_mon.group(1))
+
+            if rx_totales.search(linea):
+                continue
+
+            m_fecha = rx_fecha_linea.match(linea)
+            if not m_fecha:
+                continue
+
+            partes_all = linea.split()
+            if not partes_all:
+                continue
+
+            fecha_oper = partes_all[0]
+            idx_rec = next(
+                (i for i, p in enumerate(partes_all[1:], 1) if re.fullmatch(r'\d{6,}', _strip_accents(p))),
+                None
+            )
+            if idx_rec is None:
+                continue
+
+            sucursal = ' '.join(partes_all[1:idx_rec]).strip()
+            recibo = partes_all[idx_rec]
+            bultos = partes_all[idx_rec + 1] if idx_rec + 1 < len(partes_all) else ''
+            importe = partes_all[idx_rec + 2] if idx_rec + 2 < len(partes_all) else ''
+
+            regs = {
+                'FECHA': fecha_oper,
+                'SUCURSAL': sucursal,
+                'RECIBO': recibo,
+                'BULTOS': bultos,
+                'MONEDA': moneda_actual or 'PYG',
+                'IMPORTE': importe,
+                'ING_EGR': '',
+                'CLASIFICACION': 'BULTOS_ATM',
+                'FECHA_ARCHIVO': fecha_archivo,
+                'MOTIVO_MOVIMIENTO': '',
+                'AGENCIA': agencia or (agencia_carpeta or ''),
+                'SALDO_ANTERIOR_PYG': saldo_ant_pyg,
+                'SALDO_ANTERIOR_USD': saldo_ant_usd,
+            }
+            registros.append(regs)
+
+    cols = [
+        'FECHA', 'SUCURSAL', 'RECIBO', 'BULTOS', 'MONEDA', 'IMPORTE',
+        'ING_EGR', 'CLASIFICACION', 'FECHA_ARCHIVO', 'MOTIVO_MOVIMIENTO',
+        'AGENCIA', 'SALDO_ANTERIOR_PYG', 'SALDO_ANTERIOR_USD'
+    ]
+    df_out = pd.DataFrame(registros, columns=cols) if registros else pd.DataFrame(columns=cols)
+
+    df_out.to_excel(path_salida, index=False)
+    logger.info(f'[EC_BULTOS_ATM] {filename}: {len(df_out)} filas exportadas a {path_salida}')
+    return path_salida
+
+
+# ==============================
+#  EC_BULTOS_BCO
+# ==============================
+
+def get_ec_bultos_bco(fecha_ejecucion: datetime,
+                      filename: str,
+                      dir_entrada: str,
+                      dir_consolidado: str,
+                      agencia_carpeta: Optional[str] = None) -> Optional[str]:
+    """
+    Parser EC_BULTOS_BCO (BANCO), con SALDO_ANTERIOR.
+    """
+    path_entrada = os.path.join(dir_entrada, filename)
+    p = Path(path_entrada)
+    stem_out = p.stem + '_PROCESADO'
+    out_dir = dir_consolidado
+    Path(out_dir).mkdir(parents=True, exist_ok=True)
+    path_salida = os.path.join(out_dir, f'{stem_out}.xlsx')
+
+    try:
+        hojas = _leer_hojas_general(path_entrada, None)
+    except Exception as e:
+        logger.info(f'[EC_BULTOS_BCO] {filename}: no se pudo leer Excel: {e}')
+        return None
+
+    registros: List[Dict[str, Any]] = []
+
+    rx_fecha_linea = re.compile(r'^\s*(\d{1,2}/\d{1,2}/\d{4})\b')
+    rx_totales = re.compile(r'\b(TOTAL|SUBTOTAL)\b', re.IGNORECASE)
+    rx_moneda = re.compile(r'\b(GUARAN[IÍ]ES|D[ÓO]LARES|EUROS?|REALES?|PESOS?)\b', re.IGNORECASE)
+
+    for sheet_name, df in hojas.items():
+        agencia = ''
+        fecha_archivo = ''
+        moneda_actual = None
+        saldo_anterior = ''
+
+        # Agencia / fecha archivo
+        for _, row in df.iterrows():
+            linea = ' '.join(str(c) for c in row.tolist() if str(c).strip())
+            linea_up = _strip_accents(linea).upper()
+            if 'PROSEGUR PARAGUAY S.A.' in linea_up:
+                m = re.search(r'SUCURSAL:\s*([^)]+)\)', linea, flags=re.IGNORECASE)
+                if m:
+                    agencia = m.group(1).strip()
+            if 'BULTOS BANCO' in linea_up and 'AL:' in linea_up:
+                m_f = re.search(r'AL:\s*(\d{1,2}/\d{1,2}/\d{4})', linea, flags=re.IGNORECASE)
+                if m_f:
+                    fecha_archivo = m_f.group(1).strip()
+
+        # SALDO ANTERIOR
+        for _, row in df.iterrows():
+            linea = ' '.join(str(c) for c in row.tolist() if str(c).strip())
+            up = _strip_accents(linea).upper()
+            if 'SALDO ANTERIOR' in up:
+                nums = re.findall(r'[-]?\d[\d\.,]*', linea)
+                saldo_anterior = nums[-1] if nums else ''
+
+        for _, row in df.iterrows():
+            linea = ' '.join(str(c) for c in row.tolist() if str(c).strip())
+            linea_up = _strip_accents(linea).upper()
+
+            if not linea_up:
+                continue
+
+            m_mon = rx_moneda.search(linea)
+            if m_mon:
+                moneda_actual = _normaliza_moneda_iso(m_mon.group(1))
+
+            if rx_totales.search(linea):
+                continue
+
+            m_date = rx_fecha_linea.match(linea)
+            if not m_date:
+                continue
+
+            parts_all = linea.split()
+            if not parts_all:
+                continue
+
+            fecha_oper = parts_all[0]
+            idx_rec = next(
+                (i for i, p in enumerate(parts_all[1:], 1)
+                 if re.fullmatch(r'\d{6,}', _strip_accents(p))),
+                None
+            )
+            if idx_rec is None:
+                continue
+
+            sucursal = ' '.join(parts_all[1:idx_rec]).strip()
+            recibo = parts_all[idx_rec]
+            bultos = parts_all[idx_rec + 1] if idx_rec + 1 < len(parts_all) else ''
+            importe = parts_all[idx_rec + 2] if idx_rec + 2 < len(parts_all) else ''
+
+            registros.append({
+                'FECHA': fecha_oper,
+                'SUCURSAL': sucursal,
+                'RECIBO': recibo,
+                'BULTOS': bultos,
+                'MONEDA': moneda_actual or 'PYG',
+                'IMPORTE': importe,
+                'ING_EGR': '',
+                'CLASIFICACION': 'BULTOS_BCO',
+                'FECHA_ARCHIVO': fecha_archivo,
+                'MOTIVO_MOVIMIENTO': '',
+                'AGENCIA': agencia or (agencia_carpeta or ''),
+                'SALDO_ANTERIOR': saldo_anterior,
+            })
+
+    cols = [
+        'FECHA', 'SUCURSAL', 'RECIBO', 'BULTOS', 'MONEDA', 'IMPORTE',
+        'ING_EGR', 'CLASIFICACION', 'FECHA_ARCHIVO', 'MOTIVO_MOVIMIENTO',
+        'AGENCIA', 'SALDO_ANTERIOR'
+    ]
+    df_out = pd.DataFrame(registros, columns=cols) if registros else pd.DataFrame(columns=cols)
+
+    df_out.to_excel(path_salida, index=False)
+    logger.info(f'[EC_BULTOS_BCO] {filename}: {len(df_out)} filas exportadas a {path_salida}')
+    return path_salida
+
+
+# ==============================
+#  INV_ATM / INV_BCO – integración con parsers externos
+# ==============================
+
+INV_ATM_MOD: Any = None
+INV_BCO_MOD: Any = None
+
+
+def _load_inv_atm_module():
+    """
+    Carga dinámicamente el parser de inventario ATM desde:
+    - "INV ATM.py" / "INV_ATM.py" / "inv_atm.py"
+    ubicado en el mismo directorio que este script.
+    """
+    global INV_ATM_MOD
+    if INV_ATM_MOD is not None:
+        return INV_ATM_MOD
+
+    base_dir = Path(__file__).resolve().parent if "__file__" in globals() else Path.cwd()
+    candidates = ["INV ATM.py", "INV_ATM.py", "inv_atm.py"]
+    for name in candidates:
+        mod_path = base_dir / name
+        if mod_path.exists():
+            spec = importlib.util.spec_from_file_location("inv_atm_parser", mod_path)
+            module = importlib.util.module_from_spec(spec)
+            assert spec.loader is not None
+            spec.loader.exec_module(module)
+            logger.info(f"[INV_ATM] Parser externo cargado desde: {mod_path}")
+            INV_ATM_MOD = module
+            return module
+
+    raise FileNotFoundError(
+        "No se encontró archivo de parser INV ATM (INV ATM.py / INV_ATM.py / inv_atm.py) junto al unificado."
+    )
+
+
+def _load_inv_bco_module():
+    """
+    Carga dinámicamente el parser de inventario BANCO desde:
+    - "INV BCO.py" / "INV_BCO.py" / "inv_bco.py"
+    ubicado en el mismo directorio que este script.
+    """
+    global INV_BCO_MOD
+    if INV_BCO_MOD is not None:
+        return INV_BCO_MOD
+
+    base_dir = Path(__file__).resolve().parent if "__file__" in globals() else Path.cwd()
+    candidates = ["INV BCO.py", "INV_BCO.py", "inv_bco.py"]
+    for name in candidates:
+        mod_path = base_dir / name
+        if mod_path.exists():
+            spec = importlib.util.spec_from_file_location("inv_bco_parser", mod_path)
+            module = importlib.util.module_from_spec(spec)
+            assert spec.loader is not None
+            spec.loader.exec_module(module)
+            logger.info(f"[INV_BCO] Parser externo cargado desde: {mod_path}")
+            INV_BCO_MOD = module
+            return module
+
+    raise FileNotFoundError(
+        "No se encontró archivo de parser INV BANCO (INV BCO.py / INV_BCO.py / inv_bco.py) junto al unificado."
+    )
+
+
+def get_inv_atm(fecha_ejecucion: datetime,
+                filename: str,
+                dir_entrada: str,
+                dir_consolidado: str,
+                agencia_carpeta: Optional[str] = None) -> Optional[str]:
+    """
+    Parser real de inventario ATM.
+    Delegamos toda la lógica en el módulo externo INV ATM.py (función procesa_archivo),
+    y aquí solo normalizamos columnas y escribimos el Excel de salida.
+    """
+    path_entrada = Path(dir_entrada) / filename
+    out_dir = Path(dir_consolidado)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    stem_out = path_entrada.stem + "_PROCESADO"
+    path_salida = out_dir / f"{stem_out}.xlsx"
+
+    columnas = [
+        "FECHA_INVENTARIO", "DIVISA", "AGENCIA",
+        "AGRUPACION_EFECTIVO", "TIPO_VALOR",
+        "DENOMINACION", "DEPOSITO", "CJE_DEP",
+        "CANJE", "MONEDA", "IMPORTE_TOTAL",
+    ]
+
+    try:
+        mod = _load_inv_atm_module()
+        registros = mod.procesa_archivo(path_entrada)
+    except FileNotFoundError as e:
+        logger.info(f"[INV_ATM] {filename}: {e}. Se exporta Excel vacío para no cortar el flujo.")
+        df_out = pd.DataFrame(columns=columnas)
+        df_out.to_excel(path_salida, index=False)
+        return str(path_salida)
+    except Exception as e:
+        logger.info(f"[INV_ATM] {filename}: error al ejecutar procesa_archivo() del parser externo: {e}")
+        df_out = pd.DataFrame(columns=columnas)
+        df_out.to_excel(path_salida, index=False)
+        return str(path_salida)
+
+    if not registros:
+        logger.info(f"[INV_ATM] {filename}: parser externo no devolvió filas, se exporta Excel vacío.")
+        df_out = pd.DataFrame(columns=columnas)
+    else:
+        df_out = pd.DataFrame(registros)
+        # Asegurar columnas y orden
+        for c in columnas:
+            if c not in df_out.columns:
+                df_out[c] = None
+        df_out = df_out[columnas]
+
+        if agencia_carpeta:
+            # Si la agencia viene vacía en el parser original, completamos con la carpeta
+            df_out["AGENCIA"] = df_out["AGENCIA"].replace("", agencia_carpeta)
+
+    df_out.to_excel(path_salida, index=False)
+    logger.info(f"[INV_ATM] {filename}: {len(df_out)} filas exportadas a '{path_salida}'.")
+    return str(path_salida)
+
+
+def get_inv_bco(fecha_ejecucion: datetime,
+                filename: str,
+                dir_entrada: str,
+                dir_consolidado: str,
+                agencia_carpeta: Optional[str] = None) -> Optional[str]:
+    """
+    Parser real de inventario BANCO.
+    Delegamos en INV BCO.py (función procesa_archivo) y normalizamos columnas.
+    """
+    path_entrada = Path(dir_entrada) / filename
+    out_dir = Path(dir_consolidado)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    stem_out = path_entrada.stem + "_PROCESADO"
+    path_salida = out_dir / f"{stem_out}.xlsx"
+
+    columnas = [
+        "FECHA_INVENTARIO", "DIVISA", "AGENCIA",
+        "AGRUPACION_EFECTIVO", "TIPO_VALOR",
+        "DENOMINACION", "DEPOSITO", "CJE_DEP",
+        "CANJE", "MONEDA", "IMPORTE_TOTAL",
+    ]
+
+    try:
+        mod = _load_inv_bco_module()
+        registros = mod.procesa_archivo(path_entrada)
+    except FileNotFoundError as e:
+        logger.info(f"[INV_BCO] {filename}: {e}. Se exporta Excel vacío para no cortar el flujo.")
+        df_out = pd.DataFrame(columns=columnas)
+        df_out.to_excel(path_salida, index=False)
+        return str(path_salida)
+    except Exception as e:
+        logger.info(f"[INV_BCO] {filename}: error al ejecutar procesa_archivo() del parser externo: {e}")
+        df_out = pd.DataFrame(columns=columnas)
+        df_out.to_excel(path_salida, index=False)
+        return str(path_salida)
+
+    if not registros:
+        logger.info(f"[INV_BCO] {filename}: parser externo no devolvió filas, se exporta Excel vacío.")
+        df_out = pd.DataFrame(columns=columnas)
+    else:
+        df_out = pd.DataFrame(registros)
+        for c in columnas:
+            if c not in df_out.columns:
+                df_out[c] = None
+        df_out = df_out[columnas]
+
+        if agencia_carpeta:
+            df_out["AGENCIA"] = df_out["AGENCIA"].replace("", agencia_carpeta)
+
+    df_out.to_excel(path_salida, index=False)
+    logger.info(f"[INV_BCO] {filename}: {len(df_out)} filas exportadas a '{path_salida}'.")
+    return str(path_salida)
+
+
+# ==============================
+#  DISPATCHER / MAIN
+# ==============================
+
+def _count_rows_excel(xlsx_path: str) -> int:
+    try:
+        df = pd.read_excel(xlsx_path)
+        return int(df.shape[0])
+    except Exception:
+        return 0
+
+
+def _detectar_tipo(fname_upper: str) -> Optional[str]:
+    if fname_upper.startswith('EC_ATM'):
+        return 'EC_ATM'
+    if fname_upper.startswith('EC_BANCO') or fname_upper.startswith('EC_BCO'):
+        return 'EC_EFECT_BCO'
+    if fname_upper.startswith('EC_BULTOS_ATM'):
+        return 'EC_BULTOS_ATM'
+    if fname_upper.startswith('EC_BULTOS_BCO') or 'EC_BULTOS_BANCO' in fname_upper:
+        return 'EC_BULTOS_BCO'
+    if 'INV' in fname_upper and 'ATM' in fname_upper:
+        return 'INV_ATM'
+    if 'INV' in fname_upper and ('BANCO' in fname_upper or 'BCO' in fname_upper):
+        return 'INV_BCO'
+    return None
+
+
+def collect_pending_files_prosegur() -> List[Tuple[Path, str]]:
+    results: List[Tuple[Path, str]] = []
+    for ag in AGENCIES:
+        base = PENDIENTES / ag
+        if not base.exists():
+            continue
+        for p in base.rglob('*'):
+            if p.is_file() and p.suffix.lower() in ('.xls', '.xlsx'):
+                results.append((p, ag))
+    return results
+
+
+def process_single_file(path: Path, agencia: str, fecha_ejecucion: datetime):
+    fname = path.name
+    fname_upper = fname.upper()
+    tipo = _detectar_tipo(fname_upper)
+
+    logger.info(f"[ANALIZANDO] '{fname}' en carpeta '{agencia}'")
+
+    if not tipo:
+        logger.info(f" -> Tipo detectado: DESCONOCIDO, Agencia: {agencia.title()}")
+        dest_dir = get_procesado_dir(fecha_ejecucion, agencia)
+        move_original(path, dest_dir)
+        return
+
+    logger.info(f" -> Tipo detectado: {tipo}, Agencia: {agencia.title()}")
+
+    out_dir = get_procesado_dir(fecha_ejecucion, agencia)
+
+    if tipo == 'EC_ATM':
+        res = get_ec_atm(fecha_ejecucion, fname, str(path.parent), str(out_dir), agencia)
+    elif tipo == 'EC_EFECT_BCO':
+        res = get_ec_banco(fecha_ejecucion, fname, str(path.parent), str(out_dir), agencia)
+    elif tipo == 'EC_BULTOS_ATM':
+        res = get_ec_bultos_atm(fecha_ejecucion, fname, str(path.parent), str(out_dir), agencia)
+    elif tipo == 'EC_BULTOS_BCO':
+        res = get_ec_bultos_bco(fecha_ejecucion, fname, str(path.parent), str(out_dir), agencia)
+    elif tipo == 'INV_ATM':
+        res = get_inv_atm(fecha_ejecucion, fname, str(path.parent), str(out_dir), agencia)
+    elif tipo == 'INV_BCO':
+        res = get_inv_bco(fecha_ejecucion, fname, str(path.parent), str(out_dir), agencia)
+    else:
+        dest_dir = get_procesado_dir(fecha_ejecucion, agencia)
+        move_original(path, dest_dir)
+        return
+
+    if res:
+        nrows = _count_rows_excel(res)
+        logger.info(f"    -> Archivo procesado: {res} ({nrows} filas)")
+        dest_dir = get_procesado_dir(fecha_ejecucion, agencia)
+        move_original(path, dest_dir)
+    else:
+        logger.info(f"    -> No se generó salida para '{fname}', se mueve igual a PROCESADO.")
+        dest_dir = get_procesado_dir(fecha_ejecucion, agencia)
+        move_original(path, dest_dir)
+
+
+def main():
+    fecha_ejecucion = datetime.now()
+    logger.info("==== INICIO CONSOLIDADO PROSEGUR UNIFICADO ====")
+    pendientes = collect_pending_files_prosegur()
+    if not pendientes:
+        logger.info("No se encontraron archivos pendientes en PROSEGUR/<AGENCIA>/")
+        return
+
+    for path, ag in pendientes:
+        try:
+            process_single_file(path, ag, fecha_ejecucion)
+        except Exception as e:
+            logger.exception(f"Error procesando '{path.name}' ({ag}): {e}")
+
+    logger.info("==== FIN CONSOLIDADO PROSEGUR UNIFICADO ====")
+
+
+if __name__ == '__main__':
+    main()
