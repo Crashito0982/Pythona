@@ -1,0 +1,74 @@
+def puebla_tabla_ec_atm(fecha: str) -> None:
+    """
+    Pobla la tabla PLXS_PROSEGUR_EFECTATM desde PROSEGUR_EFECTATM.csv
+
+    Esquema esperado en SQL:
+      FECHA_RECIBO, SUCURSAL, RECIBO, BULTOS,
+      IMPORTE_GS, IMPORTE_USD,
+      ING_EGR, CLASIFICACION, FECHA_ARCHIVO, MOTIVO_MOVIMIENTO,
+      AGENCIA, SALDO_ANTERIOR_PYG, SALDO_ANTERIOR_USD, FECHA_CREACION
+    """
+    nombre_archivo = "PROSEGUR_EFECTATM.csv"
+    df, err = _leer_csv_consolidado(fecha, nombre_archivo)
+    if df is None:
+        raise ValueError(err or f"Error desconocido al leer {nombre_archivo}")
+
+    # FECHA (operación) → FECHA_RECIBO
+    if "FECHA" in df.columns and "FECHA_RECIBO" not in df.columns:
+        df = df.rename(columns={"FECHA": "FECHA_RECIBO"})
+
+    # Renombrar montos para que coincidan con la tabla SQL
+    # GUARANIES  -> IMPORTE_GS
+    # DOLARES   -> IMPORTE_USD
+    if "GUARANIES" in df.columns:
+        df = df.rename(columns={"GUARANIES": "IMPORTE_GS"})
+    if "DOLARES" in df.columns:
+        df = df.rename(columns={"DOLARES": "IMPORTE_USD"})
+
+    # Conversión de fechas
+    try:
+        if "FECHA_RECIBO" in df.columns:
+            df["FECHA_RECIBO"] = pd.to_datetime(
+                df["FECHA_RECIBO"], format="%d/%m/%Y", errors="coerce"
+            ).dt.date
+        if "FECHA_ARCHIVO" in df.columns:
+            df["FECHA_ARCHIVO"] = pd.to_datetime(
+                df["FECHA_ARCHIVO"], format="%d/%m/%Y", errors="coerce"
+            ).dt.date
+    except Exception as e:
+        print(f"ADVERTENCIA: No se pudo convertir fechas en EC_ATM PROSEGUR: {e}")
+
+    # Agregar FECHA_CREACION y ordenar columnas
+    df = _agrega_fecha_creacion(df)
+
+    cols_ec_atm = [
+        "FECHA_RECIBO",
+        "SUCURSAL",
+        "RECIBO",
+        "BULTOS",
+        "IMPORTE_GS",
+        "IMPORTE_USD",
+        "ING_EGR",
+        "CLASIFICACION",
+        "FECHA_ARCHIVO",
+        "MOTIVO_MOVIMIENTO",
+        "AGENCIA",
+        "SALDO_ANTERIOR_PYG",
+        "SALDO_ANTERIOR_USD",
+        "FECHA_CREACION",
+    ]
+    for col in cols_ec_atm:
+        if col not in df.columns:
+            df[col] = None
+    df = df[cols_ec_atm]
+
+    conn_ = _crea_conexion("EC_ATM_PROSEGUR")
+    try:
+        conn_.crea_tabla(df, "PLXS_PROSEGUR_EFECTATM", if_exists="append")
+        conn_.desconecta()
+        print("TABLA EC_ATM PROSEGUR POBLADA")
+    except Exception as e:
+        conn_.desconecta()
+        raise RuntimeError(
+            f"PROBLEMA CON LA CREACIÓN/INSERCIÓN EN TABLA PLXS_PROSEGUR_EFECTATM: {e}"
+        )
