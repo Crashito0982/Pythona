@@ -21,3 +21,20 @@ print(df_saldo)
 print("\nDetalle de filas con 'SALDO':")
 for idx, row in df_saldo.iterrows():
     print("Fila", idx, "->", [repr(str(x)) for x in row.tolist()])
+
+//////////////////////
+
+ruta_bco = Path("/home/leonardd/Plexus/PROSEGUR/ASU/EC_BULTOS_BCO_ASU_2025-11-12.xlsx")
+df_bco = pd.read_excel(ruta_bco, sheet_name=0, header=None, dtype=str).fillna("")
+
+mask_bco = df_bco.apply(
+    lambda row: row.astype(str).str.contains("SALDO", case=False, na=False).any(),
+    axis=1
+)
+df_saldo_bco = df_bco[mask_bco]
+
+print("Filas con 'SALDO' en BULTOS_BCO:")
+print(df_saldo_bco)
+
+for idx, row in df_saldo_bco.iterrows():
+    print("Fila", idx, "->", [repr(str(x)) for x in row.tolist()])
