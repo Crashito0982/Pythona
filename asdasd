@@ -26,10 +26,27 @@ if continuar:
                         mensaje=f"Error al realizar POST a la API. Usuario: {getpass.getuser()}."
                         logger.error(mensaje)
                         continue
-            df_final_2 = pd.concat(results, ignore_index=True)
+            # Si todas las ejecuciones fallaron y no hay resultados, evitar que el flujo se caiga
+            if len(results) == 0:
+                logger.error('No se obtuvieron resultados de la API (results vacío).')
+                consolidado_ci_validados = pd.DataFrame()
+                df_final_2 = pd.DataFrame()
+            else:
+                df_final_2 = pd.concat(results, ignore_index=True)
             df_final_2 = df_final_2.replace('N/A',pd.NA)
-            df_final_2 = convierte_fecha_string_datetime (df_final_2, column_name='FECHA VENCIMIENTO')
-            df_final_2 = convierte_fecha_string_datetime (df_final_2, column_name='FECHA EMISION')
+            # Conversión de fechas (no romper el flujo si la columna no viene en la respuesta)
+            if not df_final_2.empty:
+                col_venc = 'FECHA VENCIMIENTO' if 'FECHA VENCIMIENTO' in df_final_2.columns else ('FECHA_VENCIMIENTO' if 'FECHA_VENCIMIENTO' in df_final_2.columns else None)
+                if col_venc is not None:
+                    df_final_2 = convierte_fecha_string_datetime(df_final_2, column_name=col_venc)
+                else:
+                    logger.error("No existe columna FECHA VENCIMIENTO/FECHA_VENCIMIENTO en df_final_2")
+
+                col_emi = 'FECHA EMISION' if 'FECHA EMISION' in df_final_2.columns else ('FECHA_EMISION' if 'FECHA_EMISION' in df_final_2.columns else None)
+                if col_emi is not None:
+                    df_final_2 = convierte_fecha_string_datetime(df_final_2, column_name=col_emi)
+                else:
+                    logger.error("No existe columna FECHA EMISION/FECHA_EMISION en df_final_2")
             df_final_2 = df_final_2[df_final_2["HASH_IMAGE"] == df_final_2['HASH_IMAGE_API']].reset_index(drop=True) ## verifica que los hashes generados son iguales
             df_table_api_ci_hash = df_final_2[['NOMBRE_ARCHIVO_CI', 'NOMBRE_ARCHIVO_CI_IMG', 'NRO_CLIENTE', 'NRO_DOCUMENTO', 'HASH_IMAGE_API', 'NRO_DOCUMENTO_API', 'FECHA_VENCIMIENTO_DT','FECHA_EMISION', 
             'FECHA_CARGA']]
