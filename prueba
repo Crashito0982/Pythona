@@ -1,0 +1,16 @@
+print("df_final_2:", df_final_2.shape)
+print("df_table_api_ci_hash:", df_table_api_ci_hash.shape)
+
+# Si existe df_tabla_api_ci_hash en tu notebook, mirá su tamaño
+print("df_tabla_api_ci_hash exists?", "df_tabla_api_ci_hash" in globals())
+if "df_tabla_api_ci_hash" in globals():
+    print("df_tabla_api_ci_hash:", df_tabla_api_ci_hash.shape)
+
+# Cuántos pasarían el filtro REAL
+print("VENCIDO counts:\n", df_table_api_ci_hash["VENCIDO"].value_counts(dropna=False))
+print("CHECK_NRO_DOCUMENTO counts:\n", df_table_api_ci_hash["CHECK_NRO_DOCUMENTO"].value_counts(dropna=False))
+
+validos = df_table_api_ci_hash[(df_table_api_ci_hash["VENCIDO"]==False) & (df_table_api_ci_hash["CHECK_NRO_DOCUMENTO"]==True)]
+
+print("Validos segun API:", validos.shape)
+display(validos.head(20))
