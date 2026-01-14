@@ -1,0 +1,4 @@
+SELECT c.name, c.collation_name
+FROM sys.columns c
+WHERE c.object_id = OBJECT_ID('dbo.CORPDW_CRM_LEGIT_PRODUCTOS_A_ACTIVAR_NEW')
+  AND c.name = 'FIRMA_NAME';
