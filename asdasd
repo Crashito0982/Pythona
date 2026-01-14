@@ -12,7 +12,11 @@ if continuar:
            
         else:
             logger.info('INICIA PROCESO DE REQUEST A LA API')
-            with ThreadPoolExecutor(max_workers=cant_workers) as executor:
+            # En Jupyter/Windows, ProcessPoolExecutor puede no heredar variables globales (spawn).
+            # Para mantener el comportamiento de producción (ProcessPoolExecutor) sin romper el notebook,
+            # se usa ThreadPoolExecutor solo en modo test.
+            ExecutorClass = ThreadPoolExecutor if is_test else ProcessPoolExecutor
+            with ExecutorClass(max_workers=cant_workers) as executor:
                 futures = [executor.submit(post_api, row) for _, row in consolidados_base_con_ci_validar_2.iterrows()]
                 for future in as_completed(futures):
                     try:
