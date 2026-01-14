@@ -90,3 +90,4 @@ if continuar:
         mensaje = f"Error al realizar POST a la API. Usuario: {getpass.getuser()}."
         continuar = False
         logger.error(mensaje)
+
