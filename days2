@@ -7,7 +7,7 @@
 ),
 act AS (
   SELECT
-    FECHA_DT,
+    CAST(FECHA_DT AS date) AS DIA,
     CASE
       WHEN RIGHT(COALESCE(FIRMA_NAME,''), 4) COLLATE Latin1_General_100_CI_AS = '.jpg' THEN 'FACPOD'
       WHEN RIGHT(COALESCE(FIRMA_NAME,''), 4) COLLATE Latin1_General_100_CI_AS = '.png' THEN 'AXENTRIA'
@@ -18,7 +18,11 @@ act AS (
     AND FECHA_DT >= '2025-12-01'
     AND FECHA_DT <  '2026-01-01'
 )
-SELECT ORIGEN, COUNT(*) AS activados
+SELECT
+  DIA,
+  SUM(CASE WHEN ORIGEN='FACPOD'   THEN 1 ELSE 0 END) AS activados_facpod,
+  SUM(CASE WHEN ORIGEN='AXENTRIA' THEN 1 ELSE 0 END) AS activados_axentria,
+  COUNT(*) AS activados_total
 FROM act
-GROUP BY ORIGEN
-ORDER BY activados DESC;
+GROUP BY DIA
+ORDER BY DIA;
